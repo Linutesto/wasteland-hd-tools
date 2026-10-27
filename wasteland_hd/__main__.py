@@ -18,9 +18,15 @@ import sys
 import time
 import zipfile
 
-from . import sheets as sh
 from .gamefiles import ART_TYPES, Game, map_art
-from .upscale import LIGHTNING, Comfy, lanczos
+
+
+def __getattr__(name):
+    # Existing tooling can access cli.sh while installer-only Python stays Pillow-free.
+    if name == 'sh':
+        from . import sheets
+        return sheets
+    raise AttributeError(name)
 
 
 def select_art(game, args):
@@ -47,6 +53,7 @@ def cmd_list(args):
 
 
 def cmd_sheets(args):
+    from . import sheets as sh
     game = Game(args.game)
     frames = sh.frames_of(game, select_art(game, args))
     os.makedirs(os.path.join(args.work, "sheets"), exist_ok=True)
@@ -63,6 +70,7 @@ def cmd_sheets(args):
 
 
 def cmd_upscale(args):
+    from .upscale import LIGHTNING, Comfy, lanczos
     os.makedirs(os.path.join(args.work, "upscaled"), exist_ok=True)
     fast = Comfy(args.comfy, steps=8, cfg=1.0, lora=LIGHTNING[8])
     full = Comfy(args.comfy, steps=args.steps)
@@ -86,6 +94,7 @@ def cmd_upscale(args):
 
 
 def cmd_cut(args):
+    from . import sheets as sh
     total = 0
     for src in sheet_paths(args.work, "upscaled"):
         total += len(sh.cut_sheet(os.path.join(args.work, "sheets", os.path.basename(src)), src, args.work))
