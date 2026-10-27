@@ -20,7 +20,7 @@ anywhere: the model runs on your computer.
 | `diffusion_models/` | `qwen_image_edit_2511_fp8mixed.safetensors` | [Comfy-Org/Qwen-Image-Edit_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI) |
 | `text_encoders/` | `qwen_2.5_vl_7b_fp8_scaled.safetensors` | [Comfy-Org/Qwen-Image_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI) |
 | `vae/` | `qwen_image_vae.safetensors` | [Comfy-Org/Qwen-Image_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI) |
-| `loras/` (optional, 5× faster) | `Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors` | [lightx2v/Qwen-Image-Edit-2511-Lightning](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning) |
+| `loras/` (optional, 5× faster) | `Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors` | [lightx2v/Qwen-Image-Edit-2511-Lightning](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning) (top folder) |
 
 No such card? `--backend lanczos` runs the whole pipeline with a plain
 resize, so you can try everything, and the art packs published separately
