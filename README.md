@@ -25,7 +25,9 @@ here does anything.
    It checks that the folder holds a real Fallout 2 install, then downloads
    the packs from [wasteland-hd-assets](https://github.com/Linutesto/wasteland-hd-assets),
    verifies their checksums and unpacks them into the game's `data/` folder.
-   Run it again later for new packs.
+   Interrupted downloads resume via HTTP Range when the server supports it;
+   the complete ZIP is checked before any art is installed. Run it again
+   later for new packs.
 
 The HD engine that draws these packs (Wasteland Reborn HD, Android app and
 Windows) is still being built; until it ships, the packs are for testing.

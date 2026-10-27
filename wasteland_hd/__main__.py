@@ -148,11 +148,39 @@ def cmd_manifest(args):
 ASSETS = "https://raw.githubusercontent.com/Linutesto/wasteland-hd-assets/main/packs.json"
 
 
+def _download_pack(url, partial, expected_size):
+    """Resume HTTP downloads when the server honours Range; restart otherwise."""
+    import urllib.request
+
+    offset = os.path.getsize(partial) if os.path.isfile(partial) else 0
+    if offset > expected_size:
+        os.unlink(partial)
+        offset = 0
+    if offset == expected_size:
+        return
+    headers = {"Range": f"bytes={offset}-"} if offset else {}
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=120) as response:
+        content_range = response.headers.get("Content-Range", "")
+        resumed = (offset > 0 and getattr(response, "status", None) == 206
+                   and content_range.startswith(f"bytes {offset}-"))
+        with open(partial, "ab" if resumed else "wb") as output:
+            while chunk := response.read(1 << 20):
+                output.write(chunk)
+    if os.path.getsize(partial) != expected_size:
+        raise ValueError(f"download size mismatch for {url}; partial download kept for retry")
+
+
 def cmd_install(args):
     """Downloads the published HD packs into a Wasteland Reborn game folder, after checking it holds Fallout 2."""
     import hashlib
     import json
+    import re
+    import shutil
+    import stat
+    import tempfile
     import urllib.request
+    from pathlib import Path
 
     from .gamefiles import check_fallout2
 
@@ -160,34 +188,69 @@ def cmd_install(args):
     if problem:
         sys.exit(f"{problem}\nWasteland HD needs your own Fallout 2 (Steam, GOG or Epic) installed with Wasteland Reborn.")
     data_dir = os.path.join(args.game, "data")
-    with urllib.request.urlopen(args.packs) as r:
+    with urllib.request.urlopen(args.packs, timeout=60) as r:
         packs = json.load(r)["packs"]
     for pack in packs:
         if args.only and pack["name"] not in args.only:
             continue
-        stamp = os.path.join(data_dir, "hd", f".{pack['name']}.sha256")
+        name, filename, digest_expected = pack["name"], pack["file"], pack["sha256"]
+        expected_size = pack["size"]
+        if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name)
+                or name in (".", "..") or not isinstance(filename, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.zip", filename)
+                or not isinstance(digest_expected, str)
+                or not re.fullmatch(r"[0-9a-fA-F]{64}", digest_expected)
+                or type(expected_size) is not int or not 0 < expected_size < 16 * 1024**3):
+            raise ValueError("invalid HD pack manifest entry")
+        stamp = os.path.join(data_dir, "hd", f".{name}.sha256")
         if os.path.exists(stamp) and open(stamp).read().strip() == pack["sha256"]:
-            print(f"{pack['name']}: up to date")
+            print(f"{name}: up to date")
             continue
-        tmp = os.path.join(args.game, pack["file"] + ".part")
-        print(f"{pack['name']}: downloading {pack['size'] / 1e6:.0f} MB")
+        tmp = os.path.join(args.game, filename + ".part")
+        print(f"{name}: downloading {expected_size / 1e6:.0f} MB")
+        _download_pack(pack["url"], tmp, expected_size)
         digest = hashlib.sha256()
-        with urllib.request.urlopen(pack["url"]) as r, open(tmp, "wb") as f:
-            while chunk := r.read(1 << 20):
+        with open(tmp, "rb") as payload:
+            while chunk := payload.read(1 << 20):
                 digest.update(chunk)
-                f.write(chunk)
-        if digest.hexdigest() != pack["sha256"]:
+        if digest.hexdigest().lower() != digest_expected.lower():
             os.unlink(tmp)
-            sys.exit(f"{pack['name']}: download damaged (checksum mismatch), try again")
+            sys.exit(f"{name}: download damaged (checksum mismatch), try again")
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(tmp) as z:
-            for name in z.namelist():
-                if not name.startswith("hd/") or ".." in name.split("/"):
-                    sys.exit(f"{pack['name']}: unexpected file {name} in pack")
-            z.extractall(data_dir)
+            entries = z.infolist()
+            if sum(info.file_size for info in entries) > max(128 * 1024**2, expected_size * 100):
+                sys.exit(f"{name}: archive expands beyond its size limit")
+            for info in entries:
+                parts = info.filename.rstrip("/").split("/")
+                kind = (info.external_attr >> 16) & 0o170000
+                if (len(parts) < 2 or parts[0] != "hd" or any(p in ("", ".", "..") for p in parts)
+                        or "\\" in info.filename or kind not in (0, stat.S_IFREG, stat.S_IFDIR)):
+                    sys.exit(f"{name}: unexpected file {info.filename} in pack")
+            # Validate the entire archive before publishing any of its files.
+            with tempfile.TemporaryDirectory(prefix=".hd-stage-", dir=data_dir) as temporary:
+                root = Path(temporary)
+                for info in entries:
+                    dest = root.joinpath(*info.filename.rstrip("/").split("/"))
+                    if info.is_dir():
+                        dest.mkdir(parents=True, exist_ok=True)
+                        continue
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with z.open(info) as source, dest.open("wb") as output:
+                        shutil.copyfileobj(source, output)
+                for info in entries:
+                    if info.is_dir():
+                        continue
+                    path = Path(data_dir).joinpath(*info.filename.split("/"))
+                    if not path.resolve().is_relative_to(Path(data_dir).resolve()):
+                        sys.exit(f"{name}: invalid destination {info.filename}")
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(root.joinpath(*info.filename.split("/")), path)
         os.unlink(tmp)
+        os.makedirs(os.path.dirname(stamp), exist_ok=True)
         with open(stamp, "w") as f:
-            f.write(pack["sha256"])
-        print(f"{pack['name']}: installed")
+            f.write(digest_expected)
+        print(f"{name}: installed")
 
 
 def main():

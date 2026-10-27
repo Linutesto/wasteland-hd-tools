@@ -104,10 +104,63 @@ def test_install_rejects_bad_checksum(tmp_path):
     assert not (game / "data/hd/ok").exists()
 
 
+def test_install_resumes_http_range(tmp_path, monkeypatch):
+    game = validated_game(tmp_path)
+    packs = manifest_for(tmp_path, "mini.zip", {"hd/ok": b"resume works"})
+    archive = (tmp_path / "mini.zip").read_bytes()
+    partial = len(archive) // 2
+    (game / "mini.zip.part").write_bytes(archive[:partial])
+    manifest = json.loads(packs.read_text())
+    manifest["packs"][0]["url"] = "https://example.invalid/mini.zip"
+    packs.write_text(json.dumps(manifest))
+    import urllib.request
+    original_urlopen = urllib.request.urlopen
+    seen = []
+
+    class RangeReply(io.BytesIO):
+        status = 206
+
+        def __init__(self):
+            super().__init__(archive[partial:])
+            self.headers = {"Content-Range": f"bytes {partial}-{len(archive)-1}/{len(archive)}"}
+
+    def fake_urlopen(request, **kwargs):
+        if isinstance(request, urllib.request.Request):
+            seen.append(request.get_header("Range"))
+            return RangeReply()
+        return original_urlopen(request, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    install(packs, game)
+    assert seen == [f"bytes={partial}-"]
+    assert (game / "data/hd/ok").read_bytes() == b"resume works"
+    assert not (game / "mini.zip.part").exists()
+
+
+@pytest.mark.parametrize("unsafe", ["../outside.zip", "nested/evil.zip", "bad\\\\name.zip"])
+def test_install_rejects_unsafe_manifest_filename(tmp_path, unsafe):
+    game = validated_game(tmp_path)
+    packs = manifest_for(tmp_path, "mini.zip", {"hd/ok": b"ok"})
+    doc = json.loads(packs.read_text())
+    doc["packs"][0]["file"] = unsafe
+    packs.write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="invalid HD pack manifest"):
+        install(packs, game)
+    assert not (game / "data/hd/ok").exists()
+
+
 @pytest.mark.parametrize("entry", ["evil.txt", "../outside.txt", "hd/../../outside.txt"])
 def test_install_rejects_zip_outside_hd(tmp_path, entry):
     game = validated_game(tmp_path)
     packs = manifest_for(tmp_path, "mini.zip", {"hd/good.png": b"good", entry: b"bad"})
+    with pytest.raises(SystemExit, match="unexpected file"):
+        install(packs, game)
+    assert not (game / "data/hd/good.png").exists()
+
+
+def test_install_rejects_backslash_zip_path(tmp_path):
+    game = validated_game(tmp_path)
+    packs = manifest_for(tmp_path, "mini.zip", {"hd/good.png": b"good", "hd/..\\outside.txt": b"bad"})
     with pytest.raises(SystemExit, match="unexpected file"):
         install(packs, game)
     assert not (game / "data/hd/good.png").exists()
