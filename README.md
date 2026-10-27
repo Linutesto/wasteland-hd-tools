@@ -78,12 +78,16 @@ The original colour and alpha are matched exactly at tile edges. It writes
 to a **separate directory** so the original AI output remains available:
 
 ```sh
+mkdir -p work/seamfix
+cp -a work/hd work/seamfix/
 python -m wasteland_hd seams --game "C:/Games/Fallout 2" \
   --source work/hd --out work/seamfix/hd
+python -m wasteland_hd pack --work work/seamfix --out arroyo-hd-seamfix.zip
 ```
 
-Use the resulting `work/seamfix/hd/art/tiles/` in place of `work/hd/art/tiles/`
-when assembling the final pack; the other art categories stay unchanged.
+The copied tree preserves all non-floor art; the seam pass changes only its
+tile PNGs. On Windows, copy the `work/hd` folder to `work/seamfix/hd` with
+Explorer or PowerShell instead of using `cp -a`.
 Defaults: 16 HD-pixel edge feather, 8-pixel texture radius, 100% microdetail
 and 25% AI macro drift. Reusable floor tiles share one original reference;
 perfectly custom **map-wide** redraws would need position-specific tile art
