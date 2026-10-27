@@ -9,6 +9,28 @@ pack it as `hd.zip` for the game.
 No Fallout 2 file is included here, and nothing here sends your files
 anywhere: the model runs on your computer.
 
+## Play it (you need Fallout 2)
+
+You need your own Fallout 2 from Steam, GOG or Epic. Without it, nothing
+here does anything.
+
+1. Install **Wasteland Reborn** with its Windows installer
+   ([download](https://github.com/Linutesto/wasteland-reborn-installer/releases/latest)).
+   It finds your Fallout 2 and can put the game on your phone.
+2. Get the ready-made HD packs (no graphics card needed):
+   ```sh
+   pip install pillow
+   python -m wasteland_hd install --game "%LOCALAPPDATA%\WastelandReborn\game"
+   ```
+   It checks that the folder holds a real Fallout 2 install, then downloads
+   the packs from [wasteland-hd-assets](https://github.com/Linutesto/wasteland-hd-assets),
+   verifies their checksums and unpacks them into the game's `data/` folder.
+   Run it again later for new packs.
+
+The HD engine that draws these packs (Wasteland Reborn HD, Android app and
+Windows) is still being built; until it ships, the packs are for testing.
+Want your own look instead? Make your own packs below.
+
 ## What you need
 
 - Fallout 2 (Steam, GOG or Epic): the folder with `master.dat` and `critter.dat`.
@@ -32,8 +54,10 @@ need no card at all.
 # Arroyo, the first village, start to finish (ComfyUI running on :8188):
 python -m wasteland_hd all --game "C:/Games/Fallout 2" --map arvillag.map --work work --out arroyo-hd.zip
 
-# Faster, with the Lightning LoRA (loses some tiny details, like flies):
-python -m wasteland_hd all --game "C:/Games/Fallout 2" --map arvillag.map --work work --lightning 8
+# --quality auto (the default): the 8-step Lightning LoRA for still art, full
+# 30 steps for animations (Lightning drops tiny details like flies unevenly
+# between frames, which flickers). --quality fast / full force one mode.
+python -m wasteland_hd all --game "C:/Games/Fallout 2" --map arvillag.map --work work --quality full
 
 # Every floor tile in the game:
 python -m wasteland_hd all --game "C:/Games/Fallout 2" --type tiles --work tiles --out tiles-hd.zip
@@ -42,6 +66,28 @@ python -m wasteland_hd all --game "C:/Games/Fallout 2" --type tiles --work tiles
 The steps also run one at a time (`list`, `sheets`, `upscale`, `cut`,
 `pack`), and every step can be re-run: finished sheets are skipped, so
 an interrupted run continues where it stopped.
+
+### Fix floor tile seams after AI upscaling
+
+Diffusion can redraw neighbouring isometric floor tiles with incompatible
+lighting, textures and details. Run a deterministic seam pass on the **cut**
+frames before packing them (extra dependencies: `pip install numpy scipy`).
+It blends invented large-scale colour/shape changes back toward Fallout 2's
+own tile art and retains Qwen's high-frequency detail inside the tile.
+The original colour and alpha are matched exactly at tile edges. It writes
+to a **separate directory** so the original AI output remains available:
+
+```sh
+python -m wasteland_hd seams --game "C:/Games/Fallout 2" \
+  --source work/hd --out work/seamfix/hd
+```
+
+Use the resulting `work/seamfix/hd/art/tiles/` in place of `work/hd/art/tiles/`
+when assembling the final pack; the other art categories stay unchanged.
+Defaults: 16 HD-pixel edge feather, 8-pixel texture radius, 100% microdetail
+and 25% AI macro drift. Reusable floor tiles share one original reference;
+perfectly custom **map-wide** redraws would need position-specific tile art
+and an engine lookup keyed by map coordinates.
 
 **How it works.** Small sprites are packed onto 512×512 sheets on a flat
 background (one model call per sheet instead of per sprite). Each sheet is

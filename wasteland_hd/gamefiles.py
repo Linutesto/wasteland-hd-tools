@@ -111,6 +111,25 @@ class Game:
         return f"art/{ART_TYPES[type_index]}/{names[index]}"
 
 
+def check_fallout2(game_dir):
+    """None if the folder holds a real Fallout 2 (both archives, readable, with the game's maps and art), else why not."""
+    for name in ("master.dat", "critter.dat"):
+        path = find_ci(game_dir, name)
+        if not path:
+            return f"No {name} in {game_dir}."
+        try:
+            dat = Dat(path)
+        except Exception as e:  # truncated or not a DAT2 archive
+            return f"{name} could not be read: {e}"
+        if name == "master.dat":
+            needed = ("maps/arvillag.map", "art/tiles/tiles.lst", "color.pal", "text/english/game/proto.msg")
+        else:
+            needed = ("art/critters/hanpwraa.frm",)
+        if len(dat.entries) < (10000 if name == "master.dat" else 5000) or not all(n in dat for n in needed):
+            return f"{name} is not Fallout 2's."
+    return None
+
+
 def find_ci(directory, *parts):
     """Case-insensitive path lookup (game folders mix cases)."""
     path = directory
