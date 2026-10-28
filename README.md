@@ -29,6 +29,12 @@ here does anything.
    the complete ZIP is checked before any art is installed. Run it again
    later for new packs.
 
+   Or take the art straight from git: all of it is in
+   [wasteland-hd-assets](https://github.com/Linutesto/wasteland-hd-assets)
+   (also linked here as the `art` submodule:
+   `git clone --recurse-submodules`). Copy its `hd/` folder into the
+   game's `data/` folder.
+
 The HD engine that draws these packs (Wasteland Reborn HD, Android app and
 Windows) is still being built; until it ships, the packs are for testing.
 Want your own look instead? Make your own packs below.
