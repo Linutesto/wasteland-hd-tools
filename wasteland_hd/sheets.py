@@ -51,16 +51,30 @@ def frames_of(game, art_paths):
     return out
 
 
-def pack(frames, sheet=SHEET, gutter=GUTTER):
-    """Shelf packing, tallest first. Returns a list of sheets, each a list of (Placement, Frame)."""
-    order = sorted(frames, key=lambda f: (-f[3].height, -f[3].width))
+def pack(frames, sheet=SHEET, gutter=GUTTER, by_animation=False):
+    """Shelf packing, tallest first. Returns a list of sheets, each a list of (Placement, Frame).
+
+    by_animation: each animation direction's frames in order on a row of its
+    own, so the model draws a walk cycle in one pass and sees every frame:
+    drawn apart, frames each invent their own beard, armband or trouser
+    pattern, and the animation boils.
+    """
+    if by_animation:
+        order = sorted(frames, key=lambda f: (f[0], f[1], f[2]))
+    else:
+        order = sorted(frames, key=lambda f: (-f[3].height, -f[3].width))
     sheets, current, x, y, shelf = [], [], gutter, gutter, 0
+    group = None
     for art, d, i, frame in order:
         w, h = frame.width, frame.height
         if w + 2 * gutter > sheet or h + 2 * gutter > sheet:
             # Larger than a sheet: alone on a sheet of its own size.
             sheets.append([(Placement(art, d, i, gutter, gutter, w, h), frame)])
             continue
+        if by_animation and (art, d) != group:
+            group = (art, d)
+            if x > gutter:
+                x, y, shelf = gutter, y + shelf + gutter, 0
         if x + w + gutter > sheet:
             x, y, shelf = gutter, y + shelf + gutter, 0
         if y + h + gutter > sheet:
@@ -81,8 +95,8 @@ def sheet_size(items, sheet=SHEET, gutter=GUTTER):
     return (w + 7) // 8 * 8, (h + 7) // 8 * 8
 
 
-def render_sheet(items, palette, path):
-    w, h = sheet_size(items)
+def render_sheet(items, palette, path, sheet=SHEET):
+    w, h = sheet_size(items, sheet)
     img = Image.new("RGB", (w, h), BACKGROUND)
     mask = Image.new("L", (w, h), 0)
     for p, frame in items:

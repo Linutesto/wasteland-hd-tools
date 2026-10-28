@@ -35,7 +35,7 @@ def test_lanczos_sheet_cut_pack_roundtrip(tmp_path, monkeypatch):
     work = tmp_path / "work"
     output = tmp_path / "pack.zip"
     args = types.SimpleNamespace(game="dummy", map=[], type=["tiles"], work=str(work),
-                                 backend="lanczos", quality="auto", steps=30, seed=42, render_scale=2, comfy="", out=str(output))
+                                 backend="lanczos", quality="auto", steps=30, seed=42, render_scale=2, sheet_size=512, prompt="art", comfy="", out=str(output))
     cli.cmd_sheets(args)
     cli.cmd_upscale(args)
     cli.cmd_cut(args)

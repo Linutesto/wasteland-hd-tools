@@ -15,6 +15,15 @@ PROMPT = (
     "same outline, shape, colours, lighting and perspective. Add crisp fine detail to sand, rock, wood, thatch, "
     "cloth, metal and skin. Keep the background flat grey. Do not add, remove or merge objects."
 )
+# Critter sheets (sheets.pack by_animation): one row per animation direction.
+ANIMATION_PROMPT = (
+    "This is a sheet of animation frames from the isometric 1990s game Fallout 2 on a flat grey background. "
+    "Each row shows consecutive frames of the same character in one movement. Upscale it to high resolution, "
+    "like remastered HD game art. Draw the character identically in every frame of a row: the same face, hair, "
+    "beard, skin, clothes, straps, armbands, patterns, colours and lighting; only the pose changes. Keep every "
+    "sprite exactly where it is, with the same outline, shape and perspective. Keep the background flat grey. "
+    "Do not add, remove or merge objects."
+)
 NEGATIVE = "blurry, smeared, oversmoothed, watercolor, new objects, text, watermark, changed layout, merged sprites"
 
 LIGHTNING = {
@@ -35,8 +44,9 @@ def lanczos(src, dst, scale=2):
 
 
 class Comfy:
-    def __init__(self, url="http://127.0.0.1:8188", steps=30, cfg=4.0, seed=42, models=QWEN_MODELS, lora=None):
+    def __init__(self, url="http://127.0.0.1:8188", steps=30, cfg=4.0, seed=42, models=QWEN_MODELS, lora=None, prompt=PROMPT):
         self.url, self.steps, self.cfg, self.seed, self.models = url.rstrip("/"), steps, cfg, seed, models
+        self.prompt = prompt
         # Lightning LoRA (lightx2v): 4 or 8 steps at cfg 1 instead of 30 at cfg 4.
         self.lora = lora
 
@@ -64,7 +74,7 @@ class Comfy:
             "vae": {"class_type": "VAELoader", "inputs": {"vae_name": m["vae"]}},
             "lora": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["unet", 0], "lora_name": self.lora or "", "strength_model": 1.0}},
             "ms": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["lora" if self.lora else "unet", 0], "shift": 3.0}},
-            "pos": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"clip": ["clip", 0], "prompt": PROMPT, "vae": ["vae", 0], "image1": ["scaled", 0]}},
+            "pos": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"clip": ["clip", 0], "prompt": self.prompt, "vae": ["vae", 0], "image1": ["scaled", 0]}},
             "neg": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"clip": ["clip", 0], "prompt": NEGATIVE, "vae": ["vae", 0], "image1": ["scaled", 0]}},
             "enc": {"class_type": "VAEEncode", "inputs": {"pixels": ["scaled", 0], "vae": ["vae", 0]}},
             "ks": {"class_type": "KSampler", "inputs": {"model": ["ms", 0], "positive": ["pos", 0], "negative": ["neg", 0], "latent_image": ["enc", 0],

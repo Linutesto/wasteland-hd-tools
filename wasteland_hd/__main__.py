@@ -5,6 +5,7 @@
   python -m wasteland_hd upscale --work WORK [--backend qwen|lanczos] [--comfy URL]
   python -m wasteland_hd cut     --work WORK
   python -m wasteland_hd seams   --game DIR --source WORK/hd --out FIXED/hd
+  python -m wasteland_hd stabilise --game DIR --source WORK/hd --out FIXED/hd
   python -m wasteland_hd qa      --game DIR --work WORK [--also RETRY]  (drop recoloured frames)
   python -m wasteland_hd retry   --game DIR --work WORK   (sheets of rejected frames, in WORK/retry)
   python -m wasteland_hd pack    --work WORK --out hd.zip
@@ -71,17 +72,18 @@ def cmd_sheets(args):
     animated = {art for art, _d, i, _f in frames if i > 0}
     for kind in ("static", "anim"):
         group = [f for f in frames if (f[0] in animated) == (kind == "anim")]
-        for i, items in enumerate(sh.pack(group) if group else []):
+        for i, items in enumerate(sh.pack(group, sheet=args.sheet_size) if group else []):
             path = os.path.join(args.work, "sheets", f"{kind}-{i:05d}.png")
-            size = sh.render_sheet(items, game.palette(), path)
+            size = sh.render_sheet(items, game.palette(), path, sheet=args.sheet_size)
             print(f"{path}: {len(items)} frames, {size[0]}x{size[1]}")
 
 
 def cmd_upscale(args):
-    from .upscale import LIGHTNING, Comfy, lanczos
+    from .upscale import ANIMATION_PROMPT, LIGHTNING, PROMPT, Comfy, lanczos
     os.makedirs(os.path.join(args.work, "upscaled"), exist_ok=True)
-    fast = Comfy(args.comfy, steps=8, cfg=1.0, lora=LIGHTNING[8], seed=args.seed)
-    full = Comfy(args.comfy, steps=args.steps, seed=args.seed)
+    prompt = ANIMATION_PROMPT if args.prompt == "animation" else PROMPT
+    fast = Comfy(args.comfy, steps=8, cfg=1.0, lora=LIGHTNING[8], seed=args.seed, prompt=prompt)
+    full = Comfy(args.comfy, steps=args.steps, seed=args.seed, prompt=prompt)
 
     def model_for(sheet):
         if args.backend == "lanczos":
@@ -119,6 +121,15 @@ def cmd_seams(args):
     print(f"{count} edge-reconciled floor tiles in {args.out}")
 
 
+def cmd_stabilise(args):
+    from .temporal import stabilise_directory
+
+    scores = stabilise_directory(Game(args.game), args.source, args.out, radius=args.radius)
+    for group, values in scores.items():
+        print(f"{group}: {values['before']:.3f} -> {values['after']:.3f} flicker")
+    print(f"{len(scores)} critter directions stabilised in {args.out}")
+
+
 def cmd_qa(args):
     from . import qa
     qa.check(Game(args.game), args.work, also=args.also or [], limit=args.limit, keep_passing=args.keep_passing)
@@ -136,9 +147,9 @@ def cmd_retry(args):
     out = os.path.join(args.work, "retry", "sheets")
     os.makedirs(out, exist_ok=True)
     # "anim-" so `upscale --quality auto` gives them full steps too.
-    for i, items in enumerate(sh.pack(frames) if frames else []):
+    for i, items in enumerate(sh.pack(frames, sheet=args.sheet_size) if frames else []):
         path = os.path.join(out, f"anim-{i:05d}.png")
-        sh.render_sheet(items, game.palette(), path)
+        sh.render_sheet(items, game.palette(), path, sheet=args.sheet_size)
     print(f"{len(frames)} rejected frames on {len(glob.glob(os.path.join(out, '*.png.json')))} sheets in {out}; next:\n"
           f"  upscale --work {os.path.join(args.work, 'retry')} --quality full --seed 7\n"
           f"  cut --work {os.path.join(args.work, 'retry')}\n"
@@ -308,11 +319,18 @@ def main():
     p.add_argument("--sigma", type=float, default=8, help="scale dividing AI microtexture from large-scale colour drift")
     p.add_argument("--detail", type=float, default=1.0, help="AI microtexture strength")
     p.add_argument("--macro", type=float, default=0.25, help="amount of AI large-scale colour drift retained inside tiles")
+    p = sub.add_parser("stabilise", help="CPU-only original-guided temporal stabilisation of HD critters")
+    p.add_argument("--game", required=True, help="your own Fallout 2 game folder")
+    p.add_argument("--source", required=True, help="HD folder containing art/critters/")
+    p.add_argument("--out", required=True, help="empty separate destination HD folder")
+    p.add_argument("--radius", type=int, default=9, help="native pixels for original-only patch matching")
     for name in ("qa", "retry"):
         p = sub.add_parser(name, help="drop frames the model recoloured; --also adds another run's frames as candidates"
                            if name == "qa" else "sheets of the frames qa rejected, for another upscale run")
         p.add_argument("--game", required=True, help="your own Fallout 2 game folder")
         p.add_argument("--work", required=True, help="work folder (with hd/)")
+        if name == "retry":
+            p.add_argument("--sheet-size", type=int, default=512, help="native sheet size (256 for --render-scale 4)")
         if name == "qa":
             p.add_argument("--also", action="append", help="another work folder whose hd/ frames are candidates too")
             p.add_argument("--limit", type=float, default=12.0, help="largest average colour change kept (0-255)")
@@ -323,6 +341,10 @@ def main():
             p.add_argument("--game", required=True, help="Fallout 2 folder (with master.dat)")
             p.add_argument("--map", action="append", help="art used by this map, e.g. arvillag.map")
             p.add_argument("--type", action="append", choices=ART_TYPES, help="all art of a type")
+            if name != "list":
+                # Qwen keeps sprites in place up to ~1024 px of output; at
+                # --render-scale 4 a 512 sheet (2048 px) drifts, so use 256.
+                p.add_argument("--sheet-size", type=int, default=512, help="native sheet size (256 for --render-scale 4)")
         if name != "list":
             p.add_argument("--work", required=True, help="work folder")
         if name in ("upscale", "all"):
@@ -332,6 +354,8 @@ def main():
                            help="auto: Lightning (8 steps) for still art, full steps for animations; fast: Lightning for all; full: full steps for all")
             p.add_argument("--steps", type=int, default=30, help="steps of the full mode")
             p.add_argument("--seed", type=int, default=42)
+            p.add_argument("--prompt", choices=("art", "animation"), default="art",
+                           help="animation: for sheets packed one animation per row (critters)")
             p.add_argument("--render-scale", type=int, default=2, choices=(2, 3, 4),
                            help="draw sheets at this scale; cut shrinks them to 2x (4: finer detail, ~4x slower)")
         if name in ("pack", "all"):
