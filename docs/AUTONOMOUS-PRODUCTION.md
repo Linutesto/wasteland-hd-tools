@@ -75,7 +75,7 @@ tree; candidates remain in attempt directories. Their fallback is explicitly
 
 Before colour/structure QA, the entire direction must have readable RGBA PNGs,
 exact 2x dimensions and alpha byte-identical to nearest-neighbour source alpha.
-**Raw** candidates must pass QA before optional CPU processing. Floor seams
+**Raw** candidates must pass QA before optional CPU processing. Floor tiles
 also require spatial fidelity: after reducing to native size and blurring at
 sigma 1.5 native pixels, mean RGB error must be at most 6/255. Invisible RGB
 is replaced with the native background before this comparison. This was added
