@@ -65,9 +65,30 @@ python -m wasteland_hd all --game "C:/Games/Fallout 2" --map arvillag.map --work
 python -m wasteland_hd all --game "C:/Games/Fallout 2" --type tiles --work tiles --out tiles-hd.zip
 ```
 
-The steps also run one at a time (`list`, `sheets`, `upscale`, `cut`,
+The steps also run one at a time (`list`, `sheets`, `upscale`, `cut`, `qa`,
 `pack`), and every step can be re-run: finished sheets are skipped, so
 an interrupted run continues where it stopped.
+
+### Drop frames the model recoloured (do this before the seam pass)
+
+Now and then the model redraws a sprite in other colours or as something
+else: a red laser pistol turns brown, a dark floor becomes tan planks. On
+the whole game that was about 15% of frames, and nearly all of them change
+the sprite's average colour, which `qa` measures against your original art:
+
+```sh
+python -m wasteland_hd qa    --game "C:/Games/Fallout 2" --work work
+python -m wasteland_hd retry --game "C:/Games/Fallout 2" --work work
+python -m wasteland_hd upscale --work work/retry --quality full --seed 7
+python -m wasteland_hd cut     --work work/retry
+python -m wasteland_hd qa    --game "C:/Games/Fallout 2" --work work --also work/retry
+```
+
+`qa` moves frames whose average colour moved by more than 12 (of 255) to
+`work/rejected/` (nothing is deleted) and writes `work/qa.json`. A second run
+at full steps with another seed fixes about 60% of them; with `--also`, `qa`
+keeps the least changed version of every frame. Frames that are still
+wrong stay out of the pack, and the game draws the original art for them.
 
 ### Fix floor tile seams after AI upscaling
 

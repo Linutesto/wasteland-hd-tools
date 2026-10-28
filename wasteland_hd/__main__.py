@@ -5,6 +5,8 @@
   python -m wasteland_hd upscale --work WORK [--backend qwen|lanczos] [--comfy URL]
   python -m wasteland_hd cut     --work WORK
   python -m wasteland_hd seams   --game DIR --source WORK/hd --out FIXED/hd
+  python -m wasteland_hd qa      --game DIR --work WORK [--also RETRY]  (drop recoloured frames)
+  python -m wasteland_hd retry   --game DIR --work WORK   (sheets of rejected frames, in WORK/retry)
   python -m wasteland_hd pack    --work WORK --out hd.zip
   python -m wasteland_hd all     --game DIR --work WORK [...]   (sheets, upscale, cut, pack)
   python -m wasteland_hd install --game DIR       (download the published packs; needs Fallout 2)
@@ -72,8 +74,8 @@ def cmd_sheets(args):
 def cmd_upscale(args):
     from .upscale import LIGHTNING, Comfy, lanczos
     os.makedirs(os.path.join(args.work, "upscaled"), exist_ok=True)
-    fast = Comfy(args.comfy, steps=8, cfg=1.0, lora=LIGHTNING[8])
-    full = Comfy(args.comfy, steps=args.steps)
+    fast = Comfy(args.comfy, steps=8, cfg=1.0, lora=LIGHTNING[8], seed=args.seed)
+    full = Comfy(args.comfy, steps=args.steps, seed=args.seed)
 
     def model_for(sheet):
         if args.backend == "lanczos":
@@ -109,6 +111,32 @@ def cmd_seams(args):
     count = reconcile_directory(Game(args.game), args.source, args.out, feather=args.feather,
                                 sigma=args.sigma, detail=args.detail, macro=args.macro)
     print(f"{count} edge-reconciled floor tiles in {args.out}")
+
+
+def cmd_qa(args):
+    from . import qa
+    qa.check(Game(args.game), args.work, also=args.also or [], limit=args.limit)
+
+
+def cmd_retry(args):
+    """Sheets of the frames `qa` rejected, in <work>/retry, for another upscale run (full steps, other seed)."""
+    from . import qa
+    from . import sheets as sh
+    game = Game(args.game)
+    wanted = {}
+    for art, d, i in qa.rejected_frames(args.work):
+        wanted.setdefault(art, set()).add((d, i))
+    frames = [f for f in sh.frames_of(game, sorted(wanted)) if (f[1], f[2]) in wanted[f[0]]]
+    out = os.path.join(args.work, "retry", "sheets")
+    os.makedirs(out, exist_ok=True)
+    # "anim-" so `upscale --quality auto` gives them full steps too.
+    for i, items in enumerate(sh.pack(frames) if frames else []):
+        path = os.path.join(out, f"anim-{i:05d}.png")
+        sh.render_sheet(items, game.palette(), path)
+    print(f"{len(frames)} rejected frames on {len(glob.glob(os.path.join(out, '*.png.json')))} sheets in {out}; next:\n"
+          f"  upscale --work {os.path.join(args.work, 'retry')} --quality full --seed 7\n"
+          f"  cut --work {os.path.join(args.work, 'retry')}\n"
+          f"  qa --work {args.work} --also {os.path.join(args.work, 'retry')}")
 
 
 def cmd_pack(args):
@@ -274,6 +302,14 @@ def main():
     p.add_argument("--sigma", type=float, default=8, help="scale dividing AI microtexture from large-scale colour drift")
     p.add_argument("--detail", type=float, default=1.0, help="AI microtexture strength")
     p.add_argument("--macro", type=float, default=0.25, help="amount of AI large-scale colour drift retained inside tiles")
+    for name in ("qa", "retry"):
+        p = sub.add_parser(name, help="drop frames the model recoloured; --also adds another run's frames as candidates"
+                           if name == "qa" else "sheets of the frames qa rejected, for another upscale run")
+        p.add_argument("--game", required=True, help="your own Fallout 2 game folder")
+        p.add_argument("--work", required=True, help="work folder (with hd/)")
+        if name == "qa":
+            p.add_argument("--also", action="append", help="another work folder whose hd/ frames are candidates too")
+            p.add_argument("--limit", type=float, default=12.0, help="largest average colour change kept (0-255)")
     for name in ("list", "sheets", "upscale", "cut", "pack", "all"):
         p = sub.add_parser(name)
         if name in ("list", "sheets", "all"):
@@ -288,6 +324,7 @@ def main():
             p.add_argument("--quality", choices=("auto", "fast", "full"), default="auto",
                            help="auto: Lightning (8 steps) for still art, full steps for animations; fast: Lightning for all; full: full steps for all")
             p.add_argument("--steps", type=int, default=30, help="steps of the full mode")
+            p.add_argument("--seed", type=int, default=42)
         if name in ("pack", "all"):
             p.add_argument("--out", default="hd.zip")
     args = ap.parse_args()
