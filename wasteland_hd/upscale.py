@@ -6,6 +6,7 @@ import os
 import time
 import urllib.request
 import uuid
+import hashlib
 
 from PIL import Image
 
@@ -49,10 +50,11 @@ class Comfy:
         self.prompt = prompt
         # Lightning LoRA (lightx2v): 4 or 8 steps at cfg 1 instead of 30 at cfg 4.
         self.lora = lora
+        self.timeout = 1800
 
     def _post_json(self, path, body):
         req = urllib.request.Request(self.url + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
-        return json.load(urllib.request.urlopen(req))
+        return json.load(urllib.request.urlopen(req, timeout=60))
 
     def _upload(self, path):
         boundary = uuid.uuid4().hex
@@ -62,7 +64,7 @@ class Comfy:
         body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{name}\"\r\n"
                 f"Content-Type: image/png\r\n\r\n").encode() + payload + f"\r\n--{boundary}--\r\n".encode()
         req = urllib.request.Request(self.url + "/upload/image", body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
-        return json.load(urllib.request.urlopen(req))["name"]
+        return json.load(urllib.request.urlopen(req, timeout=60))["name"]
 
     def graph(self, image_name, width, height):
         m = self.models
@@ -90,8 +92,11 @@ class Comfy:
         if not self.lora:
             del graph["lora"]
         prompt_id = self._post_json("/prompt", {"prompt": graph})["prompt_id"]
+        deadline = time.monotonic() + self.timeout
         while True:
-            history = json.load(urllib.request.urlopen(f"{self.url}/history/{prompt_id}"))
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"ComfyUI prompt {prompt_id} exceeded {self.timeout}s")
+            history = json.load(urllib.request.urlopen(f"{self.url}/history/{prompt_id}", timeout=60))
             if prompt_id in history:
                 entry = history[prompt_id]
                 if entry["status"].get("status_str") == "error":
@@ -99,11 +104,58 @@ class Comfy:
                 for out in entry["outputs"].values():
                     for image in out.get("images", []):
                         q = urllib.parse.urlencode({"filename": image["filename"], "subfolder": image.get("subfolder", ""), "type": image["type"]})
-                        with urllib.request.urlopen(f"{self.url}/view?{q}") as r, open(dst, "wb") as f:
+                        with urllib.request.urlopen(f"{self.url}/view?{q}", timeout=120) as r, open(dst, "wb") as f:
                             f.write(r.read())
                         return
                 raise RuntimeError("ComfyUI returned no image")
             time.sleep(1)
+
+
+def render_matches(path, source, scale, model=None):
+    """Resume only intact output produced with the requested model settings.
+
+    ComfyUI embeds its graph in PNGs, including older renders without our
+    source-hash receipt. Lanczos receipts identify the source bytes too.
+    """
+    try:
+        with Image.open(source) as native, Image.open(path) as rendered:
+            if rendered.size != (native.width * scale, native.height * scale):
+                return False
+            graph = json.loads(rendered.info.get("prompt", "{}"))
+            rendered.verify()
+        receipt = path + ".render.json"
+        if os.path.exists(receipt):
+            with open(receipt) as f:
+                saved = json.load(f)
+            if saved["source_sha256"] != hashlib.sha256(open(source, "rb").read()).hexdigest():
+                return False
+            if saved["backend"] != ("qwen" if model else "lanczos"):
+                return False
+        elif model is None:
+            return False
+        if model is None:
+            return True
+        samplers = [n["inputs"] for n in graph.values() if n.get("class_type") == "KSampler"]
+        prompts = [n["inputs"].get("prompt") for n in graph.values()
+                   if n.get("class_type") == "TextEncodeQwenImageEditPlus"]
+        loras = [n["inputs"].get("lora_name") for n in graph.values()
+                 if n.get("class_type") == "LoraLoaderModelOnly"]
+        return (len(samplers) == 1 and all(samplers[0].get(k) == v for k, v in
+                {"steps": model.steps, "cfg": model.cfg, "seed": model.seed}.items())
+                and model.prompt in prompts and loras == ([model.lora] if model.lora else [])
+                and any(n.get("class_type") == "UNETLoader" and
+                        n["inputs"].get("unet_name") == model.models["unet"] for n in graph.values()))
+    except (OSError, ValueError, KeyError, TypeError, SyntaxError):
+        return False
+
+
+def write_render_receipt(path, source, model=None):
+    with open(source, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    temporary = path + ".render.json.part"
+    with open(temporary, "w") as f:
+        json.dump({"source_sha256": digest, "backend": "qwen" if model else "lanczos"}, f)
+    os.replace(temporary, path + ".render.json")
 
 
 import urllib.parse  # noqa: E402  (used in Comfy.upscale)

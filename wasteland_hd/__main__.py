@@ -79,7 +79,7 @@ def cmd_sheets(args):
 
 
 def cmd_upscale(args):
-    from .upscale import ANIMATION_PROMPT, LIGHTNING, PROMPT, Comfy, lanczos
+    from .upscale import ANIMATION_PROMPT, LIGHTNING, PROMPT, Comfy, lanczos, render_matches, write_render_receipt
     os.makedirs(os.path.join(args.work, "upscaled"), exist_ok=True)
     prompt = ANIMATION_PROMPT if args.prompt == "animation" else PROMPT
     fast = Comfy(args.comfy, steps=8, cfg=1.0, lora=LIGHTNING[8], seed=args.seed, prompt=prompt)
@@ -87,19 +87,27 @@ def cmd_upscale(args):
 
     def model_for(sheet):
         if args.backend == "lanczos":
-            return lanczos
+            return None
         if args.quality == "fast" or (args.quality == "auto" and not os.path.basename(sheet).startswith("anim-")):
-            return fast.upscale
-        return full.upscale
+            return fast
+        return full
 
     todo = sheet_paths(args.work, "sheets")
     for n, src in enumerate(todo, 1):
         dst = os.path.join(args.work, "upscaled", os.path.basename(src))
-        if os.path.exists(dst):
+        model = model_for(src)
+        if os.path.exists(dst) and render_matches(dst, src, args.render_scale, model):
             continue
+        if os.path.exists(dst):
+            # Preserve mismatched historical renders instead of silently using
+            # Lightning output in a requested full-quality run.
+            stale = os.path.join(args.work, "upscaled-stale", str(time.time_ns()))
+            os.makedirs(stale, exist_ok=True)
+            os.replace(dst, os.path.join(stale, os.path.basename(dst)))
         t = time.time()
-        model_for(src)(src, dst + ".part.png", scale=args.render_scale)
+        (model.upscale if model else lanczos)(src, dst + ".part.png", scale=args.render_scale)
         os.replace(dst + ".part.png", dst)
+        write_render_receipt(dst, src, model)
         print(f"[{n}/{len(todo)}] {os.path.basename(src)} {time.time() - t:.0f}s", flush=True)
 
 
