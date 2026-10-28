@@ -76,6 +76,13 @@ tree; candidates remain in attempt directories. Their fallback is explicitly
 Before colour/structure QA, the entire direction must have readable RGBA PNGs,
 exact 2x dimensions and alpha byte-identical to nearest-neighbour source alpha.
 **Raw** candidates must pass QA before optional CPU processing. Floor seams
+also require spatial fidelity: after reducing to native size and blurring at
+sigma 1.5 native pixels, mean RGB error must be at most 6/255. Invisible RGB
+is replaced with the native background before this comparison. This was added
+after the Arroyo 4x A/B test passed invented planks through mean-colour QA.
+The threshold is conservative and does not establish semantic correctness or
+scene-wide coherence; mixed original/HD fallbacks still require visual review.
+Floor seams
 are enabled by default (`--no-seams` disables them); `--stabilise` optionally
 runs the existing critter stabiliser. Postprocessed candidates must pass the
 integrity and QA gates again. Stabilisation is off by default: it adds CPU work
