@@ -9,6 +9,8 @@ the original's opaque pixels, above COLOUR_LIMIT. Frames below it looked
 right in early samples, but the 4x Arroyo comparison exposed false accepts:
 dirt became wood/planks while keeping almost the same average colour.
 Floor tiles therefore also require native-scale spatial structure agreement.
+All frames require exact 2x dimensions and the source's nearest-neighbour
+alpha mask; colour comparisons alone cannot establish engine geometry.
 
 Re-running a drifted frame at full steps fixes about 60% of them (Arroyo: 29
 of 49), so `retry` makes sheets of the rejected frames for another run and
@@ -81,7 +83,15 @@ def structure_difference(hd, orig, *, source_background=False):
 
 
 def badness(hd, orig, rel, limit):
-    """Worst colour/structure ratio (<=1 passes); floors get a stricter spatial gate."""
+    """Worst geometry/colour/structure ratio (<=1 passes); floors get a spatial gate."""
+    # Colour comparisons resize to native resolution, so they cannot detect a
+    # misplaced frame or a changed silhouette. The engine expects exact 2x
+    # geometry and nearest-neighbour alpha from the original FRM.
+    if hd.size != (orig.width * 2, orig.height * 2) or "A" not in hd.getbands():
+        return 1_000_000.0
+    expected_alpha = orig.getchannel("A").resize(hd.size, Image.Resampling.NEAREST)
+    if hd.getchannel("A").tobytes() != expected_alpha.tobytes():
+        return 1_000_000.0
     shift = colour_shift(hd, orig)
     if shift is None:  # nothing opaque: nothing can be wrong
         return 0.0

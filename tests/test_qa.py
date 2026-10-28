@@ -94,3 +94,22 @@ def test_floor_keeps_fine_texture_and_ignores_transparent_rgb():
     detailed = original.resize((128, 64), Image.Resampling.NEAREST)
     detailed.paste((255, 0, 255, 0), (0, 0, 64, 64))
     assert qa.badness(detailed, original, "art/tiles/dirt/0_0.png", 12) <= 1
+
+
+def test_qa_rejects_wrong_geometry_and_chooses_valid_retry(tmp_path, monkeypatch):
+    original = Image.new('RGBA', (4, 4), RED)
+    monkeypatch.setattr(qa, 'original_frame', lambda _g, _c, _rel: original)
+    rel = 'art/tiles/dirt/0_0.png'
+    work, retry = tmp_path / 'work', tmp_path / 'retry'
+    for root in (work, retry):
+        (root / 'hd/art/tiles/dirt').mkdir(parents=True)
+    Image.new('RGBA', (7, 8), RED).save(work / 'hd' / rel)
+    assert qa.badness(Image.open(work / 'hd' / rel), original, rel, 12) > 1
+    changed_alpha = Image.new('RGBA', (8, 8), RED)
+    changed_alpha.putpixel((0, 0), (200, 30, 30, 0))
+    assert qa.badness(changed_alpha, original, rel, 12) > 1
+    Image.new('RGBA', (8, 8), RED).save(retry / 'hd' / rel)
+    result = qa.check(None, str(work), also=[str(retry)], log=lambda _m: None)
+    assert not result[rel]['rejected']
+    assert result[rel]['source'] == '../retry/hd'
+    assert Image.open(work / 'hd' / rel).size == (8, 8)
