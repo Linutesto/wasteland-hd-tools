@@ -69,3 +69,28 @@ def test_keep_passing_prefers_the_current_frame(tmp_path, monkeypatch):
     assert results["art/misc/a/0_0.png"]["source"] == "hd"
     results = qa.check(None, str(work), also=[str(old)], log=lambda _m: None)
     assert results["art/misc/a/0_0.png"]["source"] == "../old/hd"
+
+
+def test_floor_rejects_invented_planks_despite_matching_average_colour():
+    original = Image.new("RGBA", (64, 32), (100, 90, 80, 255))
+    planks = original.resize((128, 64), Image.Resampling.NEAREST)
+    for y in range(64):
+        for x in range(128):
+            delta = 35 if (x // 16) % 2 else -35
+            planks.putpixel((x, y), (100 + delta, 90 + delta, 80 + delta, 255))
+    assert qa.colour_shift(planks, original) == 0
+    assert qa.badness(planks, original, "art/tiles/dirt/0_0.png", 12) > 1
+
+
+def test_floor_keeps_fine_texture_and_ignores_transparent_rgb():
+    original = Image.new("RGBA", (64, 32), (100, 90, 80, 255))
+    detailed = original.resize((128, 64), Image.Resampling.NEAREST)
+    for y in range(64):
+        for x in range(128):
+            delta = 8 if (x + y) % 2 else -8
+            detailed.putpixel((x, y), (100 + delta, 90 + delta, 80 + delta, 255))
+    assert qa.badness(detailed, original, "art/tiles/dirt/0_0.png", 12) <= 1
+    original.paste((0, 0, 0, 0), (0, 0, 32, 32))
+    detailed = original.resize((128, 64), Image.Resampling.NEAREST)
+    detailed.paste((255, 0, 255, 0), (0, 0, 64, 64))
+    assert qa.badness(detailed, original, "art/tiles/dirt/0_0.png", 12) <= 1

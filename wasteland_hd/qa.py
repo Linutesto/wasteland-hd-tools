@@ -3,10 +3,12 @@
 The model sometimes redraws a sprite in other colours or as another thing:
 a red laser pistol turned brown, a dark floor turned into tan planks, grey
 thatch into yellow sand. Measured on Arroyo and the whole world (8,337
-frames), almost every such frame moves the average colour of the sprite: the
+frames), many such frames move the average colour of the sprite: the
 mean of |original - HD shrunk back to the original size| per channel, over
 the original's opaque pixels, above COLOUR_LIMIT. Frames below it looked
-right in every sample, including ones a vision model wrongly flagged.
+right in early samples, but the 4x Arroyo comparison exposed false accepts:
+dirt became wood/planks while keeping almost the same average colour.
+Floor tiles therefore also require native-scale spatial structure agreement.
 
 Re-running a drifted frame at full steps fixes about 60% of them (Arroyo: 29
 of 49), so `retry` makes sheets of the rejected frames for another run and
@@ -28,6 +30,10 @@ COLOUR_LIMIT = 12.0
 # 10-13 for the right frames of the same animation). Thin scenery sprites
 # score high here even when right, so only critters use it.
 STRUCTURE_LIMIT = 18.0
+# Conservative native-scale RGB error (0..255), Gaussian sigma=1.5 native px.
+# This rejects invented broad motifs while permitting subpixel HD texture.
+# It is a reference-fidelity gate, not a universal semantic-quality score.
+FLOOR_STRUCTURE_LIMIT = 6.0
 
 
 def original_frame(game, cache, rel):
@@ -60,24 +66,30 @@ def colour_shift(hd, orig):
     return sum(abs(x - y) for x, y in zip(a, b)) / 3
 
 
-def structure_difference(hd, orig):
+def structure_difference(hd, orig, *, source_background=False):
     """Mean difference (0-255) of the blurred images over orig's opaque pixels, or None if it has none."""
     mask = orig.getchannel("A")
     if not mask.getbbox():
         return None
     blur = ImageFilter.GaussianBlur(1.5)
-    small = hd.convert("RGB").resize(orig.size, Image.BOX).filter(blur)
+    small = hd.convert("RGB").resize(orig.size, Image.BOX)
+    if source_background:
+        # Invisible RGB must not leak into the comparison through the blur.
+        small.paste(orig.convert("RGB"), (0, 0), ImageChops.invert(mask))
+    small = small.filter(blur)
     return sum(ImageStat.Stat(ImageChops.difference(orig.convert("RGB").filter(blur), small), mask).mean) / 3
 
 
 def badness(hd, orig, rel, limit):
-    """How far over the limits a frame is (<= 1 passes); critters are also held to STRUCTURE_LIMIT."""
+    """Worst colour/structure ratio (<=1 passes); floors get a stricter spatial gate."""
     shift = colour_shift(hd, orig)
     if shift is None:  # nothing opaque: nothing can be wrong
         return 0.0
     score = shift / limit
     if rel.startswith("art/critters/"):
         score = max(score, structure_difference(hd, orig) / STRUCTURE_LIMIT)
+    elif rel.startswith("art/tiles/"):
+        score = max(score, structure_difference(hd, orig, source_background=True) / FLOOR_STRUCTURE_LIMIT)
     return score
 
 
