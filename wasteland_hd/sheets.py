@@ -40,10 +40,14 @@ def frames_of(game, art_paths):
         except (FileNotFoundError, Exception) as e:  # broken or missing art is skipped, not fatal
             print(f"skip {art}: {e}")
             continue
-        for d in unique_directions(frm):
+        # Some critters keep each direction in its own file, <name>.fr0-.fr5:
+        # one direction inside, filed under the direction of its extension.
+        ext = art.rsplit(".", 1)[-1].lower()
+        fixed = int(ext[2]) if len(ext) == 3 and ext[:2] == "fr" and ext[2] in "012345" else None
+        for d in [0] if fixed is not None else unique_directions(frm):
             for i, frame in enumerate(frm.directions[d]):
                 if frame.width and frame.height:
-                    out.append((art, d, i, frame))
+                    out.append((art, d if fixed is None else fixed, i, frame))
     return out
 
 

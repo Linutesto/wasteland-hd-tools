@@ -18,11 +18,16 @@ import json
 import os
 import shutil
 
-from PIL import Image, ImageStat
+from PIL import Image, ImageChops, ImageFilter, ImageStat
 
 from .gamefiles import frame_rgba, read_frm
 
 COLOUR_LIMIT = 12.0
+# Critters also get a shape check: a walking man redrawn with grey trousers
+# keeps his average colour (shift 4) but his blurred image moves (20-30 vs
+# 10-13 for the right frames of the same animation). Thin scenery sprites
+# score high here even when right, so only critters use it.
+STRUCTURE_LIMIT = 18.0
 
 
 def original_frame(game, cache, rel):
@@ -30,8 +35,17 @@ def original_frame(game, cache, rel):
     art, name = rel.rsplit("/", 1)
     direction, frame = map(int, name[:-4].split("_"))
     if art not in cache:
-        cache[art] = read_frm(game.read(art + ".frm"))
-    fr = cache[art].directions[direction][frame]
+        try:
+            cache[art] = read_frm(game.read(art + ".frm"))
+        except FileNotFoundError:  # one file per direction (sheets.frames_of)
+            cache[art] = None
+    if cache[art] is None:
+        key = f"{art}.fr{direction}"
+        if key not in cache:
+            cache[key] = read_frm(game.read(key))
+        fr = cache[key].directions[0][frame]
+    else:
+        fr = cache[art].directions[direction][frame]
     return Image.frombytes("RGBA", (fr.width, fr.height), frame_rgba(fr, game.palette()))
 
 
@@ -46,6 +60,27 @@ def colour_shift(hd, orig):
     return sum(abs(x - y) for x, y in zip(a, b)) / 3
 
 
+def structure_difference(hd, orig):
+    """Mean difference (0-255) of the blurred images over orig's opaque pixels, or None if it has none."""
+    mask = orig.getchannel("A")
+    if not mask.getbbox():
+        return None
+    blur = ImageFilter.GaussianBlur(1.5)
+    small = hd.convert("RGB").resize(orig.size, Image.BOX).filter(blur)
+    return sum(ImageStat.Stat(ImageChops.difference(orig.convert("RGB").filter(blur), small), mask).mean) / 3
+
+
+def badness(hd, orig, rel, limit):
+    """How far over the limits a frame is (<= 1 passes); critters are also held to STRUCTURE_LIMIT."""
+    shift = colour_shift(hd, orig)
+    if shift is None:  # nothing opaque: nothing can be wrong
+        return 0.0
+    score = shift / limit
+    if rel.startswith("art/critters/"):
+        score = max(score, structure_difference(hd, orig) / STRUCTURE_LIMIT)
+    return score
+
+
 def frames_in(root):
     out = set()
     for dirpath, _dirs, files in os.walk(root):
@@ -55,10 +90,12 @@ def frames_in(root):
     return out
 
 
-def check(game, work, also=(), limit=COLOUR_LIMIT, log=print):
+def check(game, work, also=(), limit=COLOUR_LIMIT, log=print, keep_passing=False):
     """Picks the least drifted candidate of every frame into <work>/hd, rejected ones into <work>/rejected/hd.
 
     Candidates: <work>/hd, <work>/rejected/hd and <dir>/hd of each `also`.
+    keep_passing: a frame in <work>/hd that passes stays, even if another
+    candidate scores lower (a passing 4x-drawn frame beats an older 2x one).
     Returns {frame: {"shift", "source", "rejected"}} and writes it to <work>/qa.json.
     """
     hd_root = os.path.join(work, "hd")
@@ -69,15 +106,15 @@ def check(game, work, also=(), limit=COLOUR_LIMIT, log=print):
         orig = original_frame(game, cache, rel)
         best = None
         for root in roots:
+            if keep_passing and best is not None and best[1] == hd_root and best[0] <= 1:
+                break
             path = os.path.join(root, rel)
             if os.path.exists(path):
-                shift = colour_shift(Image.open(path), orig)
-                if shift is None:  # nothing opaque: nothing can be wrong
-                    shift = 0.0
-                if best is None or shift < best[0]:
-                    best = (shift, root)
-        shift, source = best
-        rejected = shift > limit
+                score = badness(Image.open(path), orig, rel, limit)
+                if best is None or score < best[0]:
+                    best = (score, root)
+        score, source = best
+        rejected = score > 1
         target = os.path.join(rejected_root if rejected else hd_root, rel)
         if os.path.join(source, rel) != target:
             os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -86,11 +123,11 @@ def check(game, work, also=(), limit=COLOUR_LIMIT, log=print):
         stale = os.path.join(hd_root if rejected else rejected_root, rel)
         if os.path.exists(stale):
             os.unlink(stale)
-        results[rel] = {"shift": round(shift, 2), "source": os.path.relpath(source, work), "rejected": rejected}
+        results[rel] = {"score": round(score, 3), "source": os.path.relpath(source, work), "rejected": rejected}
     with open(os.path.join(work, "qa.json"), "w") as f:
         json.dump(results, f, indent=0)
     bad = sum(r["rejected"] for r in results.values())
-    log(f"{len(results)} frames, {bad} rejected (colour shift > {limit:g}), "
+    log(f"{len(results)} frames, {bad} rejected (colour shift > {limit:g}, critter shape > {STRUCTURE_LIMIT:g}), "
         f"{sum(r['source'] not in ('hd', os.path.join('rejected', 'hd')) for r in results.values())} taken from retries")
     return results
 

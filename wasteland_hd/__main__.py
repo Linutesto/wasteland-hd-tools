@@ -36,6 +36,12 @@ def select_art(game, args):
     for m in args.map or []:
         arts.update(map_art(game, m))
     for t in args.type or []:
+        if t == "critters":
+            # critters.lst holds base names; the art is <base><weapon><action>.frm
+            # (or .fr0-.fr5, one file per direction), so list the archives.
+            arts.update(n.replace("\\", "/").lower() for dat in game.dats for n in dat.names("art/critters/")
+                        if n.lower().rsplit(".", 1)[-1] in ("frm", "fr0", "fr1", "fr2", "fr3", "fr4", "fr5"))
+            continue
         index = ART_TYPES.index(t)
         arts.update(f"art/{t}/{name}" for name in game.art_list(index))
     if not arts:
@@ -90,7 +96,7 @@ def cmd_upscale(args):
         if os.path.exists(dst):
             continue
         t = time.time()
-        model_for(src)(src, dst + ".part.png")
+        model_for(src)(src, dst + ".part.png", scale=args.render_scale)
         os.replace(dst + ".part.png", dst)
         print(f"[{n}/{len(todo)}] {os.path.basename(src)} {time.time() - t:.0f}s", flush=True)
 
@@ -115,7 +121,7 @@ def cmd_seams(args):
 
 def cmd_qa(args):
     from . import qa
-    qa.check(Game(args.game), args.work, also=args.also or [], limit=args.limit)
+    qa.check(Game(args.game), args.work, also=args.also or [], limit=args.limit, keep_passing=args.keep_passing)
 
 
 def cmd_retry(args):
@@ -310,6 +316,7 @@ def main():
         if name == "qa":
             p.add_argument("--also", action="append", help="another work folder whose hd/ frames are candidates too")
             p.add_argument("--limit", type=float, default=12.0, help="largest average colour change kept (0-255)")
+            p.add_argument("--keep-passing", action="store_true", help="keep a passing frame of hd/ even if an --also candidate scores lower")
     for name in ("list", "sheets", "upscale", "cut", "pack", "all"):
         p = sub.add_parser(name)
         if name in ("list", "sheets", "all"):
@@ -325,6 +332,8 @@ def main():
                            help="auto: Lightning (8 steps) for still art, full steps for animations; fast: Lightning for all; full: full steps for all")
             p.add_argument("--steps", type=int, default=30, help="steps of the full mode")
             p.add_argument("--seed", type=int, default=42)
+            p.add_argument("--render-scale", type=int, default=2, choices=(2, 3, 4),
+                           help="draw sheets at this scale; cut shrinks them to 2x (4: finer detail, ~4x slower)")
         if name in ("pack", "all"):
             p.add_argument("--out", default="hd.zip")
     args = ap.parse_args()
