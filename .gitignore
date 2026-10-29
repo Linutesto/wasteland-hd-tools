@@ -11,3 +11,4 @@ work/
 work-codex-*.txt
 tmp-audit/
 .codex-job-*.log
+tmp-flicker/

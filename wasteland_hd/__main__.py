@@ -6,6 +6,7 @@
   python -m wasteland_hd cut     --work WORK
   python -m wasteland_hd seams   --game DIR --source WORK/hd --out FIXED/hd
   python -m wasteland_hd stabilise --game DIR --source WORK/hd --out FIXED/hd
+  python -m wasteland_hd flicker --game DIR --source WORK/hd --json FLICKER.json  (measure animation boiling)
   python -m wasteland_hd qa      --game DIR --work WORK [--also RETRY]  (drop recoloured frames)
   python -m wasteland_hd retry   --game DIR --work WORK   (sheets of rejected frames, in WORK/retry)
   python -m wasteland_hd pack    --work WORK --out hd.zip
@@ -136,6 +137,33 @@ def cmd_stabilise(args):
     for group, values in scores.items():
         print(f"{group}: {values['before']:.3f} -> {values['after']:.3f} flicker")
     print(f"{len(scores)} critter directions stabilised in {args.out}")
+
+
+def cmd_flicker(args):
+    """Measures generation noise on pixels the original animation leaves identical."""
+    from .flicker import analyse, contact_sheet, safe_output, write_json
+
+    safe_output(args.source, args.json)
+    result = analyse(Game(args.game), args.source, names=args.anim, control=args.control)
+    for name, values in result["animations"].items():
+        print(f"{name}: flicker {values['flicker']:.3f} (broad {values['broad']:.3f}, "
+              f"fine {values['fine']:.3f}, rim {values['rim']:.3f}, material {values['material']:.3f}) "
+              f"{values['directions']} directions, {values['pixels']} pixels")
+    for group, values in result["directions"].items():
+        print(f"  {group}: {values['flicker']}")
+    if args.contact:
+        safe_output(args.source, args.contact)
+        contact_sheet(Game(args.game), args.source, result, args.contact,
+                      top=args.top, control=args.control)
+        print(f"contact sheet: {args.contact}")
+    write_json(result, args.json)
+    print(f"JSON: {args.json}")
+    if args.limit is not None:
+        over = {n: v["flicker"] for n, v in result["animations"].items()
+                if v["flicker"] is not None and v["flicker"] > args.limit}
+        if over:
+            sys.exit("over flicker limit " + f"{args.limit:g}: "
+                     + ", ".join(f"{n} {v:.3f}" for n, v in sorted(over.items())))
 
 
 def cmd_qa(args):
@@ -327,6 +355,16 @@ def main():
     p.add_argument("--sigma", type=float, default=8, help="scale dividing AI microtexture from large-scale colour drift")
     p.add_argument("--detail", type=float, default=1.0, help="AI microtexture strength")
     p.add_argument("--macro", type=float, default=0.25, help="amount of AI large-scale colour drift retained inside tiles")
+    p = sub.add_parser("flicker", help="measure per-frame generation flicker of HD critter animations")
+    p.add_argument("--game", required=True, help="your own Fallout 2 game folder")
+    p.add_argument("--source", required=True, help="HD folder containing art/critters/")
+    p.add_argument("--json", required=True, help="machine-readable report to write (never inside --source)")
+    p.add_argument("--anim", action="append", help="only this animation (default: every one in --source)")
+    p.add_argument("--control", choices=("nearest", "lanczos"),
+                   help="score a deterministic original upscale instead of the HD frames")
+    p.add_argument("--contact", help="contact sheet of the worst directions (never inside --source)")
+    p.add_argument("--top", type=int, default=4, help="directions on the contact sheet")
+    p.add_argument("--limit", type=float, help="exit nonzero if an animation scores above this")
     p = sub.add_parser("stabilise", help="CPU-only original-guided temporal stabilisation of HD critters")
     p.add_argument("--game", required=True, help="your own Fallout 2 game folder")
     p.add_argument("--source", required=True, help="HD folder containing art/critters/")
