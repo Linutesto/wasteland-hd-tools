@@ -366,7 +366,9 @@ class Controller:
         if source is None and group['art'].startswith('art/tiles/'):
             # Border correction is meaningful only for a geometrically valid
             # unmatched floor candidate. It cannot repair invented interiors.
-            for candidate in [original_source] + candidates:
+            legacy_candidates = [self.out/'jobs'/job/'attempts'/key/f'denoise-{i}'/'candidate'/'hd'
+                                 for i in range(len(DENOISE_LADDER))]
+            for candidate in [original_source] + candidates + legacy_candidates:
                 if candidate is None or not all((candidate/f['rel']).is_file() for f in group['frames']):
                     continue
                 measured = self.gate(work, group, candidate)
