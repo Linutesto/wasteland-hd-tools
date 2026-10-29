@@ -1,4 +1,11 @@
-"""Durable, local-only HD production. See docs/AUTONOMOUS-PRODUCTION.md."""
+"""Durable, local-only HD production. See docs/AUTONOMOUS-PRODUCTION.md.
+
+The optional ``--temporal`` critter stage (``temporal_stage`` plus the flicker
+gate) is a rollout option that is deliberately *not* part of ``plan.json``: the
+live root's plan is immutable and a restart refuses anything that differs byte
+for byte, so the option is filed per job type in ``options.json`` and applies
+only to job types that have not started (``docs/CRITTER-PRODUCTION-REPORT.md``).
+"""
 
 import argparse
 from contextlib import contextmanager
@@ -36,6 +43,14 @@ SETTINGS = {"backend": "qwen", "quality": "fast", "steps": 8,
             "art_prompt_sha256": hashlib.sha256(PROMPT.encode()).hexdigest(),
             "animation_prompt_sha256": hashlib.sha256(ANIMATION_PROMPT.encode()).hexdigest(),
             "negative_prompt_sha256": hashlib.sha256(NEGATIVE.encode()).hexdigest()}
+
+# Critter temporal stage + flicker gate (docs/CRITTER-TEMPORAL-REPORT.md).
+# Recorded per job type in options.json rather than in plan.json.
+TEMPORAL_SETTINGS = {"components": ["colour", "residual", "texture", "static"],
+                     "strength": 1.0, "radius": 9, "fallback_cap": 2.0,
+                     "gate": {"broad": 2.5, "material": 3.0, "flicker": 6.0},
+                     "rule": "temporal-stage/1"}
+OPTIONS = "options.json"
 
 
 def production_model(seed=42, animated=False):
@@ -187,6 +202,67 @@ def source_stamp(game):
     return digest(json.dumps(sorted(records)).encode())
 
 
+def plan_document(args, game, paths, unsupported):
+    """The immutable plan of a production root.
+
+    It contains no ``temporal`` key on purpose.  An existing root refuses to
+    restart (exit 64) unless the new document equals its stored one byte for
+    byte, so any new key here would make exactly the root we want to resume
+    unusable.  ``--temporal`` is filed per job type in ``options.json`` instead
+    (:meth:`Controller.job_options`); with the flag off this function returns
+    exactly what earlier code wrote.
+    """
+    return {"version": VERSION, "game": str(Path(args.game).resolve()),
+            "settings": SETTINGS, "seeds": args.seeds, "chunk_size": args.chunk_size,
+            "seams": args.seams, "stabilise": args.stabilise,
+            "adopt_world": str(Path(args.adopt_world).resolve()) if args.adopt_world else None,
+            "coverage_scope": "FRM and .fr0-.fr5 only; excludes RIX splash images and MVE movies",
+            "unsupported_visuals": unsupported,
+            "sources": paths, "source_stamp": source_stamp(game)}
+
+
+def gate_failures(metrics, limits):
+    """Gate components a measurement violates; an unmeasured one cannot pass."""
+    return [key for key in sorted(limits)
+            if metrics.get(key) is None or metrics[key] > limits[key]]
+
+
+def temporal_verdicts(report, settings):
+    """Per-direction flicker-gate verdicts of one temporal stage report.
+
+    A direction fails when the stage already replaced it with original art
+    (over the direction cap), when its own after-staging metrics break the gate,
+    or when its whole animation's pooled metrics break it.  Failing directions
+    are not accepted: they go to the next seed attempt and, once the seed budget
+    is spent, to the original-art fallback like every other rejection.
+
+    The metrics come from the stage's own per-direction and pooled records,
+    computed with ``flicker._measure`` on the exact arrays it writes, so the
+    gate costs no second measurement pass over the tree.
+    """
+    limits = settings["gate"]
+    directions = report.get("directions") or {}
+    animations = report.get("animations") or {}
+    verdicts = {}
+    for key, value in sorted(directions.items()):
+        metrics = value.get("after") or {}
+        animation = animations.get(value.get("animation"), {}) or {}
+        if value.get("fallback"):
+            reason = "direction_cap"
+        elif gate_failures(metrics, limits):
+            reason = "flicker_gate"
+        elif gate_failures(animation, limits):
+            reason = "animation_flicker_gate"
+        else:
+            reason = None
+        verdicts[key] = {"pass": reason is None, "reason": reason,
+                         "direction": {k: metrics.get(k) for k in limits},
+                         "animation": {k: animation.get(k) for k in limits},
+                         "animation_name": value.get("animation"),
+                         "keyframe": value.get("keyframe"), "limits": dict(limits)}
+    return verdicts
+
+
 def inventory(game, arts):
     """Decode strictly, retaining missing/unreadable sources as coverage blockers."""
     groups, frames, errors, hashes = {}, {}, [], {}
@@ -277,17 +353,48 @@ class Controller:
         self.game = game if game is not None else Game(args.game)
         self.paths, self.blockers = discover(self.game)
         self.unsupported = unsupported_visuals(self.game)
-        self.plan = {"version": VERSION, "game": str(Path(args.game).resolve()),
-                     "settings": SETTINGS, "seeds": args.seeds, "chunk_size": args.chunk_size,
-                     "seams": args.seams, "stabilise": args.stabilise,
-                     "adopt_world": str(Path(args.adopt_world).resolve()) if args.adopt_world else None,
-                     "coverage_scope": "FRM and .fr0-.fr5 only; excludes RIX splash images and MVE movies",
-                     "unsupported_visuals": self.unsupported,
-                     "sources": self.paths, "source_stamp": source_stamp(self.game)}
+        self.plan = plan_document(args, self.game, self.paths, self.unsupported)
         self.jobs = [(f"{kind}-{i // args.chunk_size:04d}", kind, self.paths[kind][i:i + args.chunk_size])
                      for kind in PRIORITY if kind in self.paths
                      for i in range(0, len(self.paths[kind]), args.chunk_size)]
         self.adopt_index = None
+        self.options = {}
+        self.temporal_gate = {}
+        self.temporal_state = {}
+
+    def job_options(self):
+        """Per-job-type options; an option cannot change a type that has started.
+
+        ``plan.json`` stays byte-identical to what earlier code wrote (see
+        :func:`plan_document`), so the live root resumes; a rollout option lives
+        here instead and is honoured only while every job of that type is still
+        unstarted.  Changing it afterwards is refused rather than silently mixed
+        into frames a different rule already produced.
+        """
+        previous = read_json(self.root / OPTIONS, {}) or {}
+        wanted = {kind: dict(value) for kind, value in previous.items()}
+        temporal = {**TEMPORAL_SETTINGS, "enabled": bool(self.args.temporal)}
+        if self.args.temporal or (previous.get("critters") or {}).get("temporal"):
+            wanted["critters"] = {**(previous.get("critters") or {}), "temporal": temporal}
+        for kind, value in sorted(wanted.items()):
+            if previous.get(kind) == value:
+                continue
+            started = [name for name, job_kind, _arts in self.jobs
+                       if job_kind == kind and self.started(name)]
+            if started:
+                raise ValueError(f"{kind} options changed after {started[0]} started; "
+                                 f"restart with the options it ran with, or use a new --root")
+        return wanted
+
+    def started(self, name):
+        work = self.root / "jobs" / name
+        state = read_json(work / "state.json", {}) or {}
+        return bool(state.get("attempts")) or any(work.glob("attempt-*"))
+
+    def temporal_for(self, kind="critters"):
+        """The temporal setting this job type runs with, or None when off."""
+        setting = (self.options.get(kind) or {}).get("temporal") or {}
+        return dict(setting) if setting.get("enabled") else None
 
     def wait_ready(self):
         deadline = time.monotonic() + self.args.ready_timeout
@@ -467,24 +574,83 @@ class Controller:
                                           "prompt": item["prompt"], "seed": seed})
         sheets.cut_sheet(str(src), str(output), str(attempt))
 
+    def run_temporal(self, hd, stage, manifest, settings):
+        """Temporal stage + per-animation flicker gate over the critter tree.
+
+        Runs on complete, integrity-checked directions only, after seams and
+        ``--stabilise``; its output is what integrity and QA then see.  The
+        stage rewrites RGB only (the source alpha at 2x nearest is copied
+        through), so both gates keep applying unchanged.
+        """
+        out = stage / "temporal" / "hd"
+        report_path = stage / "temporal-report.json"
+        try:
+            self.command(["temporal", "--game", self.args.game, "--source", hd, "--out", out,
+                          "--components", ",".join(settings["components"]),
+                          "--strength", str(settings["strength"]),
+                          "--radius", str(settings["radius"]),
+                          "--fallback-cap", str(settings["fallback_cap"]),
+                          "--json", str(report_path)], stage / "temporal.json")
+        except RuntimeError as exc:
+            raise TimeoutError(f"CPU temporal stage failed; GPU seed checkpoint retained: {exc}") from exc
+        report = read_json(report_path, {}) or {}
+        # The stage names a direction ``<art stem>/<direction>``; the manifest
+        # (and therefore state/coverage) names it ``art/critters/<stem>/<direction>``.
+        by_report = {f"{Path(group['art']).stem}/{group['direction']}": key
+                     for key, group in manifest["groups"].items()
+                     if key.startswith("art/critters/")}
+        verdicts = {}
+        for name, verdict in temporal_verdicts(report, settings).items():
+            key = by_report.get(name)
+            if key is not None:
+                verdicts[key] = verdict
+        # The stage's cap stand-in is original art at 2x nearest; production must
+        # not ship it.  Delete those frames (and every gate failure's) so the
+        # direction is missing, exactly like any other rejected direction.
+        for key, verdict in verdicts.items():
+            if verdict["pass"]:
+                continue
+            for expected in manifest["groups"].get(key, {}).get("frames", []):
+                (out / expected["rel"]).unlink(missing_ok=True)
+        gate = stage / "temporal" / "gate.json"
+        state = {"settings": settings, "report": str(report_path), "gate": str(gate),
+                 "animations": report.get("animations", {}), "verdicts": verdicts}
+        atomic_json(gate, state)
+        self.temporal_gate, self.temporal_state = verdicts, state
+        return out
+
     def postprocess(self, work, source, manifest, keys, frames):
         """Only integral whole directions enter CPU postprocessing; keep input intact."""
         checkpoint = work / "post.json"
-        signature = digest(json.dumps({key: [(f["rel"], file_digest(source / f["rel"]) if (source / f["rel"]).is_file() else None)
-                                            for f in manifest["groups"][key]["frames"]]
-                                       for key in keys}, sort_keys=True).encode())
+        temporal = self.temporal_for()
+        self.temporal_gate, self.temporal_state = {}, {}
+        payload = {key: [(f["rel"], file_digest(source / f["rel"]) if (source / f["rel"]).is_file() else None)
+                         for f in manifest["groups"][key]["frames"]]
+                   for key in keys}
+        # The stage changes what the checkpointed output means, so its options
+        # are part of the signature; with the stage off the signature is exactly
+        # what earlier code computed, so an in-flight attempt resumes unchanged.
+        if temporal:
+            payload["temporal"] = temporal
+        signature = digest(json.dumps(payload, sort_keys=True).encode())
         previous = read_json(checkpoint)
         if previous and previous.get("signature") == signature:
+            if previous.get("gate"):
+                saved = read_json(previous["gate"], {}) or {}
+                self.temporal_gate = saved.get("verdicts", {})
+                self.temporal_state = saved
             return Path(previous["hd"])
         stage = Path(tempfile.mkdtemp(prefix="post-", dir=work))
         hd = stage / "input" / "hd"
         hd.mkdir(parents=True)
+        copied = []
         for key in keys:
             group = manifest["groups"][key]
             if not evaluate(self.game, group, frames, source)["complete"]:
                 continue
             for f in group["frames"]:
                 atomic_copy(source / f["rel"], hd / f["rel"])
+            copied.append(key)
         if self.args.seams and (hd / "art" / "tiles").exists():
             out = stage / "seams" / "hd"
             shutil.copytree(hd, out)
@@ -500,13 +666,28 @@ class Controller:
             except RuntimeError as exc:
                 raise TimeoutError(f"CPU stabilise stage failed; GPU seed checkpoint retained: {exc}") from exc
             hd = out
-        atomic_json(checkpoint, {"hd": str(hd), "signature": signature})
+        # Critter animations are the only art the temporal stage owns; a tree
+        # without a multi-frame direction is left alone (the stage would refuse it).
+        if temporal and (hd / "art" / "critters").exists() and any(
+                len(manifest["groups"][key]["frames"]) > 1 for key in copied
+                if key.startswith("art/critters/")):
+            hd = self.run_temporal(hd, stage, manifest, temporal)
+        atomic_json(checkpoint, {"hd": str(hd), "signature": signature,
+                                 **({"gate": self.temporal_state["gate"]} if self.temporal_state else {})})
         return hd
 
     def accept(self, work, state, key, group, frames, candidate, provenance, raw_source=None):
         result = evaluate(self.game, group, frames, raw_source if raw_source is not None else candidate)
         if result["complete"] and raw_source is not None:
             result = evaluate(self.game, group, frames, candidate)
+        gate = self.temporal_gate.get(key)
+        if gate is not None:
+            result["flicker"] = {"pass": gate["pass"], "reason": gate["reason"],
+                                 "direction": gate["direction"], "animation": gate["animation"],
+                                 "limits": gate["limits"], "keyframe": gate["keyframe"]}
+            if not gate["pass"]:
+                result.update(complete=False, accepted=0, rejected=result["expected"],
+                              issues={"temporal_gate": gate["reason"]})
         state["groups"][key] = {**state["groups"].get(key, {}), **result, "provenance": provenance}
         if result["complete"]:
             for expected in group["frames"]:
@@ -593,10 +774,14 @@ class Controller:
                 plans = self.prepare(attempt, wanted, manifest, frames)
                 self.render(attempt, seed, plans)
                 processed = self.postprocess(attempt, attempt / "hd", manifest, wanted, frames)
+                provenance = {"kind": "generated+temporal" if self.temporal_gate else "generated",
+                              "settings": SETTINGS, "seed": seed, "attempt": index,
+                              "all_lightning": True}
+                if self.temporal_gate:
+                    provenance["temporal"] = self.temporal_for()
                 for key in wanted:
                     self.accept(work, state, key, manifest["groups"][key], frames, processed,
-                                {"kind": "generated", "settings": SETTINGS, "seed": seed,
-                                 "attempt": index, "all_lightning": True}, raw_source=attempt / "hd")
+                                dict(provenance), raw_source=attempt / "hd")
             except TimeoutError:
                 raise  # unavailable/busy server: wrapper may retry without consuming a seed
             except (RuntimeError, ValueError, OSError) as exc:
@@ -616,6 +801,12 @@ class Controller:
                 state["groups"][key]["fallback"] = "original_game_art_entire_direction"
                 for f in group["frames"]:
                     (work / "hd" / f["rel"]).unlink(missing_ok=True)
+        if self.temporal_state:
+            state["temporal"] = {key: value for key, value in self.temporal_state.items()
+                                 if key != "verdicts"}
+            state["temporal"]["directions"] = {
+                key: {name: value[name] for name in ("pass", "reason", "direction", "animation")}
+                for key, value in self.temporal_state["verdicts"].items()}
         state["source_errors"] = manifest["source_errors"]
         state["coverage_complete"] = not manifest["source_errors"] and all(
             state["groups"][key].get("complete", False) for key in manifest["groups"])
@@ -627,6 +818,7 @@ class Controller:
                     for key, value in state["groups"].items()}
         result = {"type": kind, "coverage_complete": state["coverage_complete"], "groups": coverage,
                   "source_errors": manifest["source_errors"], "package": package,
+                  "temporal": state.get("temporal"),
                   "status": "needs_review", "visual_review": "pending"}
         atomic_json(work / "coverage.json", result)
         return result
@@ -637,6 +829,12 @@ class Controller:
             if old is not None and old != self.plan:
                 raise ValueError("production plan/source changed; use original options or a new --root")
             atomic_json(self.root / "plan.json", self.plan)
+            self.options = self.job_options()
+            if self.options:
+                atomic_json(self.root / OPTIONS, self.options)
+            temporal = self.temporal_for()
+            if temporal:
+                print(f"production: critter temporal stage ON ({temporal['rule']})", flush=True)
             report = {"status": "running", "visual_review": "pending", "settings": SETTINGS,
                       "coverage_scope": self.plan["coverage_scope"], "unsupported_visuals": self.unsupported,
                       "source_errors": self.blockers, "jobs": {},
@@ -687,6 +885,8 @@ def parser():
     p.add_argument("--command-retries", type=int, default=2)
     p.add_argument("--no-seams", dest="seams", action="store_false", default=True)
     p.add_argument("--stabilise", action="store_true", help="optional CPU critter stabilisation")
+    p.add_argument("--temporal", action="store_true",
+                   help="critter temporal stage + flicker gate (CPU; per job type in options.json)")
     return p
 
 

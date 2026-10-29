@@ -60,9 +60,14 @@ GATE = {"broad": 2.5, "material": 3.0, "flicker": 6.0}
 
 
 def margin(metrics):
-    """Distance to the gate in units of the limits; < 1 passes every component."""
-    return max(metrics[key] / limit for key, limit in GATE.items()
-               if metrics.get(key) is not None)
+    """Distance to the gate in units of the limits; < 1 passes every component.
+
+    A direction with nothing measurable (no static pixel in the original, no
+    repeated palette class) has no margin to improve: 0.0.  Production's gate
+    still refuses it explicitly rather than shipping an unmeasured direction.
+    """
+    return max((metrics[key] / limit for key, limit in GATE.items()
+                if metrics.get(key) is not None), default=0.0)
 
 
 def passes(metrics):
@@ -355,9 +360,13 @@ def stage_directory(game, source_root, dest_root, *, names=None, components=COMP
     if fallback:
         for name in sorted({value["animation"] for value in staged.values()}):
             group = [value for value in staged.values() if value["animation"] == name]
-            mean = sum(value["after"]["flicker"] for value in group) / len(group)
+            measured = [value["after"]["flicker"] for value in group
+                        if value["after"]["flicker"] is not None]
+            mean = sum(measured) / len(measured) if measured else 0.0
             for value in group:
-                if value["after"]["flicker"] <= cap * mean:
+                # An unmeasurable direction has no number to compare; it is not
+                # a cap fallback (production's gate rejects it on its own).
+                if value["after"]["flicker"] is None or value["after"]["flicker"] <= cap * mean:
                     continue
                 original = flicker._nearest2(value["native"][..., :3]).astype(np.float32)
                 value["fixed"] = original
