@@ -51,14 +51,14 @@ def test_ladder_order_accepts_second_retry_and_resume_skips_render(fixture,monke
     root,out,job,rel,original,bad = fixture
     calls=[]
     good = original.resize((64,64),Image.Resampling.NEAREST)
-    def fake_render(self,job_name,key,group,step,denoise):
+    def fake_render(self,job_name,groups,pending,step,denoise):
         calls.append(denoise)
         dest=out/f'candidate-{step}'
         path=dest/rel
         path.parent.mkdir(parents=True,exist_ok=True)
         (bad if step==0 else good).save(path)
-        return dest,{'kind':'reduced_denoise','denoise':denoise}
-    monkeypatch.setattr(repair.Controller,'render',fake_render)
+        return {key:(dest,{'kind':'reduced_denoise','denoise':denoise}) for key in pending}
+    monkeypatch.setattr(repair.Controller,'render_batch',fake_render)
     report=repair.Controller(root,out).run()
     assert calls == [0.55,0.4]
     assert report['jobs']['tiles-0000']['accepted'] == 1
@@ -73,14 +73,14 @@ def test_ladder_order_accepts_second_retry_and_resume_skips_render(fixture,monke
 def test_failed_retries_use_source_floor_fallback(fixture,monkeypatch):
     root,out,job,rel,original,bad = fixture
     calls=[]
-    def fake_render(self,job_name,key,group,step,denoise):
+    def fake_render(self,job_name,groups,pending,step,denoise):
         calls.append(denoise)
         dest=out/f'candidate-{step}'
         path=dest/rel
         path.parent.mkdir(parents=True,exist_ok=True)
         bad.save(path)
-        return dest,{'kind':'reduced_denoise','denoise':denoise}
-    monkeypatch.setattr(repair.Controller,'render',fake_render)
+        return {key:(dest,{'kind':'reduced_denoise','denoise':denoise}) for key in pending}
+    monkeypatch.setattr(repair.Controller,'render_batch',fake_render)
     report=repair.Controller(root,out).run()
     assert calls == [0.55,0.4]
     row=read_json(out/'jobs/tiles-0000/coverage.json')['groups']['art/tiles/toy/0']
@@ -147,14 +147,187 @@ def test_unmatched_floor_uses_edge_lock_before_source_fallback(fixture,monkeypat
     border=original.resize((64,64),Image.Resampling.NEAREST)
     ImageDraw.Draw(border).rectangle((0,0,63,5),fill=(255,0,0,255))
     border.save(job/'hd'/rel)
-    def fake_render(self,job_name,key,group,step,denoise):
+    def fake_render(self,job_name,groups,pending,step,denoise):
         dest=out/f'candidate-{step}'
         path=dest/rel
         path.parent.mkdir(parents=True,exist_ok=True)
         border.save(path)
-        return dest,{'kind':'reduced_denoise','denoise':denoise}
-    monkeypatch.setattr(repair.Controller,'render',fake_render)
+        return {key:(dest,{'kind':'reduced_denoise','denoise':denoise}) for key in pending}
+    monkeypatch.setattr(repair.Controller,'render_batch',fake_render)
     repair.Controller(root,out).run()
     row=read_json(out/'jobs/tiles-0000/coverage.json')['groups']['art/tiles/toy/0']
     assert row['fallback'] == 'edge_lock'
     assert row['accepted']
+
+
+def _batch_fixture(fixture, monkeypatch, directions=3):
+    """Add several directions backed by one synthetic FRM and a mocked game."""
+    from wasteland_hd.gamefiles import Frame, Frm
+    root, out, job, rel, original, bad = fixture
+    frame = Frame(32, 32, 0, 0, bytes([1]) * 1024)
+    class ToyGame:
+        def read(self, name): return b'frm'
+        def palette(self): return [(0, 0, 0), (100, 90, 80)]
+    monkeypatch.setattr(repair, 'Game', lambda game: ToyGame())
+    from wasteland_hd import gamefiles
+    monkeypatch.setattr(gamefiles, 'read_frm',
+                        lambda raw: Frm(10, 0, 1, [0]*6, [0]*6, [[frame]]*6))
+    inventory = read_json(job/'inventory.json')
+    state = read_json(job/'state.json')
+    for direction in range(1, directions):
+        key = f'art/tiles/toy/{direction}'
+        relative = f'art/tiles/toy/{direction}_0.png'
+        item = dict(inventory['groups']['art/tiles/toy/0'])
+        item['direction'] = direction
+        item['frames'] = [dict(item['frames'][0], rel=relative)]
+        inventory['groups'][key] = item
+        state['groups'][key] = {'complete': True}
+        target = job/'hd'/relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        bad.save(target)
+    (job/'inventory.json').write_text(json.dumps(inventory))
+    (job/'state.json').write_text(json.dumps(state))
+    return root, out, job, original, bad
+
+
+def _mock_comfy(monkeypatch, calls, interrupt=False):
+    from PIL import PngImagePlugin
+    monkeypatch.setattr(repair.Controller, 'wait_ready', lambda self: None)
+    def upscale(self, src, dst, scale=4):
+        calls.append((self.denoise, Path(src).name))
+        with Image.open(src) as native:
+            up = native.resize((native.width*scale, native.height*scale))
+        info = PngImagePlugin.PngInfo()
+        info.add_text('prompt', json.dumps(self.graph('fixture', up.width, up.height)))
+        up.save(dst, pnginfo=info)
+        if interrupt and len(calls) == 1:
+            raise KeyboardInterrupt('after sheet output')
+    monkeypatch.setattr(repair.Comfy, 'upscale', upscale)
+
+
+def test_batch_shared_sheet_and_old_state_resume(fixture, monkeypatch):
+    root, out, job, original, bad = _batch_fixture(fixture, monkeypatch)
+    old_key = 'art/tiles/toy/0'
+    old_rel = 'art/tiles/toy/0_0.png'
+    good = original.resize((64, 64), Image.Resampling.NEAREST)
+    old_path = out/'jobs'/job.name/'hd'/old_rel
+    old_path.parent.mkdir(parents=True, exist_ok=True)
+    good.save(old_path)
+    old_gate = repair.Controller(root, out).gate(job, read_json(job/'inventory.json')['groups'][old_key], old_path.parents[3])
+    legacy = {'source':str(out/'jobs'/job.name/'attempts'/old_key/'denoise-0'/'candidate'/'hd'),
+              'gate':old_gate, 'hashes':{old_rel:repair.file_digest(old_path)},
+              'fallback':None, 'provenance':{'kind':'reduced_denoise','denoise':0.55},
+              'accepted':True}
+    state_path = out/'jobs'/job.name/'state.json'
+    state_path.write_text(json.dumps({'groups':{old_key:legacy}}))
+    calls = []
+    _mock_comfy(monkeypatch, calls, interrupt=True)
+    with pytest.raises(KeyboardInterrupt):
+        repair.Controller(root, out).run()
+    assert calls == [(0.55, 'static-00000.png')]
+    _mock_comfy(monkeypatch, calls)
+    report = repair.Controller(root, out).run()
+    assert calls == [(0.55, 'static-00000.png')]
+    assert report['jobs'][job.name]['accepted'] == 3
+    assert report['jobs'][job.name]['groups'][old_key] == legacy
+    marker = read_json(out/'jobs'/job.name/'attempts'/'batch'/'denoise-0'/'sheets.json')
+    assert marker['keys'] == ['art/tiles/toy/1', 'art/tiles/toy/2']
+    assert len(list((out/'jobs'/job.name/'attempts'/'batch'/'denoise-0').glob('*-render.png'))) == 1
+    repair.Controller(root, out).run()
+    assert calls == [(0.55, 'static-00000.png')]
+
+
+def test_batch_ladder_only_retries_failed_direction(fixture, monkeypatch):
+    root, out, job, original, bad = _batch_fixture(fixture, monkeypatch)
+    calls = []
+    _mock_comfy(monkeypatch, calls)
+    real_gate = repair.Controller.gate
+    def gate(self, work, group, source, *, overrides=None):
+        result = real_gate(self, work, group, source, overrides=overrides)
+        if (source and 'denoise-0' in str(source) and group['direction'] == 1):
+            result['complete'] = False
+            result['issues']['forced'] = 'first step rejected'
+        return result
+    monkeypatch.setattr(repair.Controller, 'gate', gate)
+    report = repair.Controller(root, out).run()
+    assert calls == [(0.55, 'static-00000.png'), (0.4, 'static-00000.png')]
+    assert report['jobs'][job.name]['accepted'] == 3
+    assert read_json(out/'jobs'/job.name/'attempts'/'batch'/'denoise-1'/'sheets.json')['keys'] == ['art/tiles/toy/1']
+    assert report['jobs'][job.name]['groups']['art/tiles/toy/1']['provenance']['seed'] == 1013
+
+
+def test_step_a_visits_next_job_before_previous_fallback(fixture, monkeypatch):
+    root, out, job, rel, original, bad = fixture
+    second = root/'jobs'/'tiles-0001'
+    second.mkdir()
+    for name in ('inventory.json', 'state.json', 'coverage.json'):
+        (second/name).write_bytes((job/name).read_bytes())
+    target = second/'hd'/'art/tiles/toy/0_0.png'
+    target.parent.mkdir(parents=True)
+    bad.save(target)
+    calls = []
+    def batch(self, job_name, groups, pending, step, denoise):
+        calls.append((job_name, step))
+        return {key:RuntimeError('mock failure') for key in pending}
+    monkeypatch.setattr(repair.Controller, 'render_batch', batch)
+    repair.Controller(root, out).run()
+    assert calls == [('tiles-0000', 0), ('tiles-0001', 0),
+                     ('tiles-0000', 1), ('tiles-0001', 1)]
+    for name in ('tiles-0000', 'tiles-0001'):
+        assert read_json(out/'jobs'/name/'coverage.json')['groups']['art/tiles/toy/0']['fallback'] == 'source_floor_2x'
+
+
+def test_batch_separates_animation_prompt_and_recovers_completed_download(fixture, monkeypatch):
+    root, out, job, original, bad = _batch_fixture(fixture, monkeypatch, directions=2)
+    inventory = read_json(job/'inventory.json')
+    inventory['groups']['art/tiles/toy/1']['animated'] = True
+    (job/'inventory.json').write_text(json.dumps(inventory))
+    from PIL import PngImagePlugin
+    monkeypatch.setattr(repair.Controller, 'wait_ready', lambda self: None)
+    calls = []
+    def upscale(self, src, dst, scale=4):
+        calls.append((self.denoise, Path(src).name, self.prompt))
+        with Image.open(src) as native:
+            up = native.resize((native.width*scale, native.height*scale))
+        info = PngImagePlugin.PngInfo()
+        info.add_text('prompt', json.dumps(self.graph('fixture', up.width, up.height)))
+        up.save(dst, pnginfo=info)
+        raise RuntimeError('download completed, then connection closed')
+    monkeypatch.setattr(repair.Comfy, 'upscale', upscale)
+    report = repair.Controller(root, out, command_retries=2).run()
+    assert report['jobs'][job.name]['accepted'] == 2
+    assert [(c[0], c[1]) for c in calls] == [(0.55, 'static-00000.png'),
+                                             (0.55, 'anim-00000.png')]
+    assert calls[0][2] != calls[1][2]
+    repair.Controller(root, out).run()
+    assert len(calls) == 2
+
+
+def test_batch_multiple_sheets_resume_after_later_sheet(fixture, monkeypatch):
+    root, out, job, original, bad = _batch_fixture(fixture, monkeypatch)
+    from wasteland_hd.gamefiles import Frame, Frm
+    from wasteland_hd import gamefiles
+    large = Frame(120, 120, 0, 0, bytes([1]) * (120*120))
+    monkeypatch.setattr(gamefiles, 'read_frm',
+                        lambda raw: Frm(10, 0, 1, [0]*6, [0]*6, [[large]]*6))
+    groups = read_json(job/'inventory.json')['groups']
+    calls = []
+    from PIL import PngImagePlugin
+    monkeypatch.setattr(repair.Controller, 'wait_ready', lambda self: None)
+    def upscale(self, src, dst, scale=4):
+        calls.append(Path(src).name)
+        with Image.open(src) as native:
+            up = native.resize((native.width*scale, native.height*scale))
+        info = PngImagePlugin.PngInfo()
+        info.add_text('prompt', json.dumps(self.graph('fixture', up.width, up.height)))
+        up.save(dst, pnginfo=info)
+        if len(calls) == 3:
+            raise KeyboardInterrupt('after third sheet output')
+    monkeypatch.setattr(repair.Comfy, 'upscale', upscale)
+    controller = repair.Controller(root, out)
+    with pytest.raises(KeyboardInterrupt):
+        controller.render_batch(job.name, groups, list(groups), 0, 0.55)
+    result = controller.render_batch(job.name, groups, list(groups), 0, 0.55)
+    assert calls == ['static-00000.png', 'static-00001.png', 'static-00002.png']
+    assert all(not isinstance(item, RuntimeError) for item in result.values())
+    assert len(list((out/'jobs'/job.name/'attempts'/'batch'/'denoise-0').glob('*-render.png'))) == 3

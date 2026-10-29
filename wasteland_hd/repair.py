@@ -203,6 +203,98 @@ class Controller:
         return candidate/'hd', {'kind':'reduced_denoise', 'denoise':denoise, 'seed':seed,
                            'settings': {**SETTINGS, 'denoise':denoise}, 'graph_verified':True}
 
+    def render_batch(self, job, groups, pending, step, denoise):
+        """Render a fixed snapshot of a job's pending directions on shared sheets.
+
+        The snapshot is durable: a restart can omit already accepted directions
+        without changing any sheet's contents or index.
+        """
+        attempt = self.out/'jobs'/job/'attempts'/'batch'/f'denoise-{step}'
+        marker = attempt/'sheets.json'
+        saved = read_json(marker)
+        if saved is None:
+            keys = list(pending)
+            attempt.mkdir(parents=True, exist_ok=True)
+            atomic_json(marker, {'keys': keys})
+        else:
+            keys = saved['keys']
+            if not set(pending).issubset(keys):
+                raise ValueError(f'repair batch changed after checkpoint: {marker}')
+        from .gamefiles import read_frm
+        frames = {False: [], True: []}
+        decoded = {}
+        for key in keys:
+            group = groups[key]
+            art = group['art']
+            if art not in decoded:
+                decoded[art] = read_frm(self.game.read(art))
+            frm = decoded[art]
+            direction = (0 if art.lower().endswith(tuple(f'.fr{i}' for i in range(6)))
+                         else group['direction'])
+            for expected in group['frames']:
+                frame_no = int(Path(expected['rel']).stem.split('_')[1])
+                frames[group['animated']].append((art, group['direction'], frame_no,
+                                                  frm.directions[direction][frame_no]))
+        candidate = attempt/'candidate'
+        failed_rels = set()
+        for animated in (False, True):
+            plans = sheets.pack(frames[animated], sheet=256, by_animation=animated)
+            model = RepairModel(denoise=denoise, seed=REPAIR_SEEDS[step], animated=animated,
+                                url=self.args.comfy)
+            for index, items in enumerate(plans):
+                name = f"{'anim' if animated else 'static'}-{index:05d}"
+                native = attempt/f'{name}.png'
+                if not (native.is_file() and Path(str(native)+'.json').is_file()
+                        and Path(str(native)+'.mask.png').is_file()):
+                    sheets.render_sheet(items, self.game.palette(), str(native), sheet=256)
+                rendered = attempt/f'{name}-render.png'
+                checkpoint = attempt/f'{name}-render.json'
+                budget = read_json(checkpoint, {'calls': 0})
+                valid = rendered.is_file() and render_matches(str(rendered), str(native), 4, model)
+                while not valid and budget['calls'] < self.args.command_retries:
+                    self.wait_ready()
+                    budget['calls'] += 1
+                    budget['status'] = 'running'
+                    atomic_json(checkpoint, budget)
+                    try:
+                        model.upscale(str(native), str(rendered), scale=4)
+                        valid = render_matches(str(rendered), str(native), 4, model)
+                        if not valid:
+                            raise ValueError('render graph differs from repair settings')
+                        write_render_receipt(str(rendered), str(native), model)
+                        budget['status'] = 'ok'
+                        budget['sha256'] = file_digest(rendered)
+                        atomic_json(checkpoint, budget)
+                    except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+                        budget['status'] = 'failed'
+                        budget['error'] = str(exc)
+                        atomic_json(checkpoint, budget)
+                        # The download may have finished before a later error.
+                        # A verified PNG is a completed render even if the call raised.
+                        valid = rendered.is_file() and render_matches(str(rendered), str(native), 4, model)
+                        if valid:
+                            write_render_receipt(str(rendered), str(native), model)
+                            budget['status'] = 'ok'
+                            budget['sha256'] = file_digest(rendered)
+                            atomic_json(checkpoint, budget)
+                if valid:
+                    sheets.cut_sheet(str(native), str(rendered), str(candidate))
+                else:
+                    failed_rels.update(sheets.hd_frame_path('', p).removeprefix('hd/')
+                                       for p, _ in items)
+        provenance = {'kind':'reduced_denoise', 'denoise':denoise,
+                      'seed':REPAIR_SEEDS[step],
+                      'settings': {**SETTINGS, 'denoise':denoise}, 'graph_verified':True}
+        result = {}
+        for key in pending:
+            group = groups[key]
+            if any(f['rel'] in failed_rels or not (candidate/'hd'/f['rel']).is_file()
+                   for f in group['frames']):
+                result[key] = RuntimeError(f'repair sheet render budget exhausted: {attempt}')
+            else:
+                result[key] = (candidate/'hd', provenance)
+        return result
+
     def candidate_from_production(self, work, group):
         if all((work/'hd'/f['rel']).is_file() for f in group['frames']):
             return work/'hd'
@@ -219,18 +311,15 @@ class Controller:
             image.save(target)
         return dest
 
-    def process_group(self, work, key, group, accepted):
+    def precheck(self, work, key, group, accepted, initial):
+        """Return an already completed direction without invoking ComfyUI."""
         job = work.name
-        original_source = self.candidate_from_production(work, group)
-        initial = self.gate(work, group, original_source) if original_source else None
         if accepted and initial and initial['complete']:
             return {'source':'production', 'gate':initial, 'fallback':None, 'accepted':True}
         if self.audit_only:
             return {'source':'production' if accepted else 'rejected_candidate',
                     'gate':initial, 'fallback':None, 'accepted':bool(initial and initial['complete'])}
-        state_path = self.out/'jobs'/job/'state.json'
-        state = read_json(state_path, {'groups': {}})
-        saved = state['groups'].get(key)
+        saved = read_json(self.out/'jobs'/job/'state.json', {'groups': {}})['groups'].get(key)
         if saved:
             if saved.get('source') == 'production' and initial and initial['complete']:
                 return saved
@@ -241,13 +330,33 @@ class Controller:
                 for f in group['frames']:
                     self.hd_index[f['rel']] = self.out/'jobs'/job/'hd'/f['rel']
                 return saved
+        return None
+
+    def process_group(self, work, key, group, accepted, prepared=None, initial=None):
+        job = work.name
+        original_source = self.candidate_from_production(work, group)
+        if initial is None and original_source:
+            initial = self.gate(work, group, original_source)
+        done = self.precheck(work, key, group, accepted, initial)
+        if done is not None:
+            return done
+        state_path = self.out/'jobs'/job/'state.json'
+        state = read_json(state_path, {'groups': {}})
         last = initial
         source = None
         method = None
+        candidates = []
         for step, denoise in enumerate(DENOISE_LADDER):
             try:
-                candidate, provenance = self.render(job, key, group, step, denoise)
-                measured = self.gate(work, group, candidate)
+                if prepared is None:
+                    candidate, provenance = self.render(job, key, group, step, denoise)
+                    measured = self.gate(work, group, candidate)
+                else:
+                    outcome = prepared[step]
+                    if isinstance(outcome, RuntimeError):
+                        raise outcome
+                    candidate, provenance, measured = outcome
+                candidates.append(candidate)
                 last = measured
                 if measured['complete']:
                     source, method = candidate, provenance
@@ -257,7 +366,7 @@ class Controller:
         if source is None and group['art'].startswith('art/tiles/'):
             # Border correction is meaningful only for a geometrically valid
             # unmatched floor candidate. It cannot repair invented interiors.
-            for candidate in [original_source] + [self.out/'jobs'/job/'attempts'/key/f'denoise-{i}'/'candidate'/'hd' for i in range(len(DENOISE_LADDER))]:
+            for candidate in [original_source] + candidates:
                 if candidate is None or not all((candidate/f['rel']).is_file() for f in group['frames']):
                     continue
                 measured = self.gate(work, group, candidate)
@@ -350,17 +459,59 @@ class Controller:
             atomic_json(self.out/'plan.json', self.plan)
             return self._run_jobs(jobs)
 
+    def _batch_jobs(self, jobs):
+        """Run each ladder round in job order, then resolve remaining fallbacks."""
+        resolved, initials, outcomes = {}, {}, defaultdict(list)
+        for work, state, manifest in jobs:
+            for key, group in manifest['groups'].items():
+                accepted = bool(state['groups'].get(key, {}).get('complete'))
+                original = self.candidate_from_production(work, group)
+                initial = self.gate(work, group, original) if original else None
+                initials[(work.name, key)] = initial
+                done = self.precheck(work, key, group, accepted, initial)
+                if done is not None:
+                    resolved[(work.name, key)] = done
+        for step, denoise in enumerate(DENOISE_LADDER):
+            for work, state, manifest in jobs:
+                pending = [key for key in manifest['groups']
+                           if (work.name, key) not in resolved]
+                if not pending:
+                    continue
+                rendered = self.render_batch(work.name, manifest['groups'], pending, step, denoise)
+                for key in pending:
+                    group = manifest['groups'][key]
+                    item = rendered[key]
+                    if isinstance(item, RuntimeError):
+                        outcome = item
+                    else:
+                        candidate, provenance = item
+                        outcome = (candidate, provenance, self.gate(work, group, candidate))
+                    outcomes[(work.name, key)].append(outcome)
+                    if not isinstance(outcome, RuntimeError) and outcome[2]['complete']:
+                        resolved[(work.name, key)] = self.process_group(
+                            work, key, group, bool(state['groups'].get(key, {}).get('complete')),
+                            prepared=outcomes[(work.name, key)], initial=initials[(work.name, key)])
+        for work, state, manifest in jobs:
+            for key, group in manifest['groups'].items():
+                if (work.name, key) not in resolved:
+                    resolved[(work.name, key)] = self.process_group(
+                        work, key, group, bool(state['groups'].get(key, {}).get('complete')),
+                        prepared=outcomes[(work.name, key)], initial=initials[(work.name, key)])
+        return resolved
+
     def _run_jobs(self,jobs):
         report = {'jobs': {}, 'summary': {}, 'audit_only': self.audit_only,
                   'production_root': str(self.root), 'verdict_examples': {}}
         examples = defaultdict(list)
         total = Counter()
+        batched = {} if self.audit_only else self._batch_jobs(jobs)
         for work,state,manifest in jobs:
             results = {}
             counts = Counter()
             for key,group in manifest['groups'].items():
                 accepted = bool(state['groups'].get(key,{}).get('complete'))
-                result = self.process_group(work,key,group,accepted)
+                result = (self.process_group(work,key,group,accepted) if self.audit_only
+                          else batched[(work.name, key)])
                 results[key] = result
                 gate = result['gate']
                 for rel,score in (gate or {}).get('frames',{}).items():
