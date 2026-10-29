@@ -135,16 +135,17 @@ def render_matches(path, source, scale, model=None):
             return False
         if model is None:
             return True
-        samplers = [n["inputs"] for n in graph.values() if n.get("class_type") == "KSampler"]
-        prompts = [n["inputs"].get("prompt") for n in graph.values()
-                   if n.get("class_type") == "TextEncodeQwenImageEditPlus"]
-        loras = [n["inputs"].get("lora_name") for n in graph.values()
-                 if n.get("class_type") == "LoraLoaderModelOnly"]
-        return (len(samplers) == 1 and all(samplers[0].get(k) == v for k, v in
-                {"steps": model.steps, "cfg": model.cfg, "seed": model.seed}.items())
-                and model.prompt in prompts and loras == ([model.lora] if model.lora else [])
-                and any(n.get("class_type") == "UNETLoader" and
-                        n["inputs"].get("unet_name") == model.models["unet"] for n in graph.values()))
+        # Compare every inference node, including sampler/scheduler/denoise,
+        # AuraFlow shift, CLIP/VAE, both prompts and LoRA strength. A matching
+        # seed + step count alone can accidentally certify a different style.
+        expected = model.graph("__source__", native.width * scale, native.height * scale)
+        if not model.lora:
+            del expected["lora"]
+        return (set(graph) == set(expected)
+                and all(graph[key] == node for key, node in expected.items()
+                        if key not in ("src", "save"))
+                and graph["src"].get("class_type") == "LoadImage"
+                and graph["save"].get("class_type") == "SaveImage")
     except (OSError, ValueError, KeyError, TypeError, SyntaxError):
         return False
 

@@ -67,9 +67,8 @@ def setup(tmp_path, monkeypatch):
                     rendered.paste((0, 240, 0), (f["x"] * 4, f["y"] * 4,
                                                (f["x"] + f["width"]) * 4, (f["y"] + f["height"]) * 4))
                 info = PngImagePlugin.PngInfo()
-                model = p.Comfy(seed=seed, prompt=ANIMATION_PROMPT if prompt == "animation" else PROMPT)
+                model = p.production_model(seed, prompt == "animation")
                 graph = model.graph("fixture", rendered.width, rendered.height)
-                del graph["lora"]
                 info.add_text("prompt", json.dumps(graph))
                 target = work / "upscaled" / src.name
                 target.parent.mkdir(exist_ok=True)
@@ -103,7 +102,7 @@ def state(controller, name="items-0000"):
     return p.read_json(controller.root / "jobs" / name / "state.json")
 
 
-def test_full_settings_priority_coverage_and_local_zip(setup):
+def test_lightning_settings_priority_coverage_and_local_zip(setup):
     make, calls, _, _ = setup
     names = {f"art/{kind}/toy.frm": 1 for kind in p.ART_TYPES}
     c = make(names)
@@ -114,9 +113,11 @@ def test_full_settings_priority_coverage_and_local_zip(setup):
     assert set(report["types"]) == set(p.ART_TYPES)
     assert report["status"] == "needs_review"
     for call in calls:
-        assert call[call.index("--quality") + 1] == "full"
-        assert call[call.index("--steps") + 1] == "30"
+        assert call[call.index("--quality") + 1] == "fast"
+        assert call[call.index("--steps") + 1] == "8"
         assert call[call.index("--render-scale") + 1] == "4"
+    assert report["settings"]["lora"] == LIGHTNING[8]
+    assert report["settings"]["output_scale"] == 2
     for archive in (c.root / "staging").glob("*.zip"):
         with zipfile.ZipFile(archive) as pack:
             assert pack.namelist()
@@ -143,6 +144,43 @@ def test_restart_skips_generation_and_missing_output_fails_complete(setup):
     assert group["accepted"] == 0
     assert group["missing"] == 1
     assert group["fallback"] == "original_game_art_entire_direction"
+
+
+def test_crash_after_valid_render_recovers_receipt_without_gpu(setup):
+    make, calls, _, _ = setup
+    c = make(extra=["--seeds", "42"])
+    c.run()
+    attempt = c.root / "jobs/items-0000/attempt-00"
+    sheet = p.read_json(attempt / "sheets.json")[0]
+    work = attempt / "renders" / Path(sheet["name"]).stem
+    (work / "cut.json").unlink()
+    count = len(calls)
+    c.render_sheet(attempt, 42, sheet)
+    assert len(calls) == count
+    assert p.read_json(work / "cut.json")["settings"] == p.SETTINGS
+
+
+def test_invalid_completed_render_archived_and_regenerated(setup):
+    make, calls, _, _ = setup
+    c = make(extra=["--seeds", "42"])
+    c.run()
+    attempt = c.root / "jobs/items-0000/attempt-00"
+    sheet = p.read_json(attempt / "sheets.json")[0]
+    work = attempt / "renders" / Path(sheet["name"]).stem
+    output = work / "upscaled" / sheet["name"]
+    previous = output.read_bytes()
+    # Simulate a corrupted/mismatched PNG with a successful old checkpoint.
+    Image.new("RGBA", (1024, 1024), (40, 30, 90, 255)).save(output)
+    count = len(calls)
+    c.render_sheet(attempt, 42, sheet)
+    assert len(calls) == count + 1
+    assert output.read_bytes() == previous
+    archives = list((work / "stale").iterdir())
+    assert len(archives) == 1
+    assert (archives[0] / "command.json").is_file()
+    assert (archives[0] / "cut.json").is_file()
+    assert (archives[0] / sheet["name"]).is_file()
+    assert p.read_json(work / "command.json")["status"] == "ok"
 
 
 def test_animation_retries_entire_direction_and_never_splices_frames(setup):
@@ -221,7 +259,7 @@ def test_discovery_union_alias_missing_and_unreadable_sources(setup):
 
 
 @pytest.mark.parametrize("fast", [False, True])
-def test_adoption_preserves_legacy_full_skips_but_lightning_regenerates(setup, tmp_path, fast):
+def test_adoption_preserves_lightning_skips_but_legacy_full_regenerates(setup, tmp_path, fast):
     make, calls, _, _ = setup
     world = tmp_path / "world"
     c = make({"art/tiles/toy.frm": 1}, extra=["--adopt-world", str(world)])
@@ -242,15 +280,41 @@ def test_adoption_preserves_legacy_full_skips_but_lightning_regenerates(setup, t
         im.resize((1024, 1024), Image.Resampling.NEAREST).save(up, pnginfo=info)
     before = {str(f): f.read_bytes() for f in world.rglob("*") if f.is_file()}
     c.run()
-    assert len(calls) == int(fast)
+    assert len(calls) == int(not fast)
     assert {str(f): f.read_bytes() for f in world.rglob("*") if f.is_file()} == before
     receipt = p.read_json(c.root / "jobs/tiles-0000/adopted/provenance.json")
-    assert receipt[up.name]["full_compatible"] == (not fast)
+    assert receipt[up.name]["lightning_compatible"] == fast
     group = state(c, "tiles-0000")["groups"]["art/tiles/toy/0"]
     assert group["complete"]
-    if not fast:
+    if fast:
         assert group["provenance"]["kind"] == "adopted"
-        assert group["provenance"]["all_full"] is True
+        assert group["provenance"]["all_lightning"] is True
+
+
+@pytest.mark.parametrize("node,field,bad", [
+    ("ks", "sampler_name", "dpmpp_2m"),
+    ("ks", "scheduler", "karras"),
+    ("ks", "denoise", 0.5),
+    ("ms", "shift", 4.0),
+    ("lora", "strength_model", 0.7),
+    ("lora", "lora_name", LIGHTNING[4]),
+    ("clip", "clip_name", "other.safetensors"),
+    ("vae", "vae_name", "other.safetensors"),
+    ("neg", "prompt", "changed negative"),
+    ("scaled", "upscale_method", "nearest-exact"),
+])
+def test_lightning_png_graph_mismatch_rejected(tmp_path, node, field, bad):
+    from wasteland_hd.upscale import render_matches
+    native = tmp_path / "original.png"
+    out = tmp_path / "upscaled.png"
+    Image.new("RGBA", (4, 4), (64, 50, 30, 255)).save(native)
+    model = p.production_model()
+    graph = model.graph("fixture", 16, 16)
+    graph[node]["inputs"][field] = bad
+    info = PngImagePlugin.PngInfo()
+    info.add_text("prompt", json.dumps(graph))
+    Image.new("RGBA", (16, 16), (64, 50, 30, 255)).save(out, pnginfo=info)
+    assert not render_matches(str(out), str(native), 4, model)
 
 
 def test_single_controller_lock_released_on_error(tmp_path):

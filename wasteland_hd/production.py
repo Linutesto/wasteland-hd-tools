@@ -21,15 +21,27 @@ from PIL import Image
 
 from . import qa, sheets
 from .gamefiles import ART_TYPES, Game, frame_rgba, norm, read_frm, unique_directions
-from .upscale import ANIMATION_PROMPT, PROMPT, Comfy, render_matches
+from .upscale import ANIMATION_PROMPT, PROMPT, NEGATIVE, LIGHTNING, QWEN_MODELS, Comfy, render_matches
 
 
-VERSION = 1
+VERSION = 2
 NEEDS_REVIEW = 2
 TEMPORARY_FAILURE = 75
 ART_SUFFIX = re.compile(r"\.(frm|fr[0-5])$", re.I)
-SETTINGS = {"backend": "qwen", "quality": "full", "steps": 30,
-            "cfg": 4.0, "render_scale": 4, "output_scale": 2, "sheet_size": 256}
+SETTINGS = {"backend": "qwen", "quality": "fast", "steps": 8,
+            "cfg": 1.0, "render_scale": 4, "output_scale": 2, "sheet_size": 256,
+            "models": QWEN_MODELS, "lora": LIGHTNING[8], "lora_strength": 1.0,
+            "sampler": "euler", "scheduler": "simple", "denoise": 1.0,
+            "auraflow_shift": 3.0, "upscale_method": "lanczos",
+            "art_prompt_sha256": hashlib.sha256(PROMPT.encode()).hexdigest(),
+            "animation_prompt_sha256": hashlib.sha256(ANIMATION_PROMPT.encode()).hexdigest(),
+            "negative_prompt_sha256": hashlib.sha256(NEGATIVE.encode()).hexdigest()}
+
+
+def production_model(seed=42, animated=False):
+    return Comfy(seed=seed, steps=SETTINGS["steps"], cfg=SETTINGS["cfg"],
+                 lora=SETTINGS["lora"],
+                 prompt=ANIMATION_PROMPT if animated else PROMPT)
 PRIORITY = ["tiles", "walls", "scenery", "items", "misc", "intrface", "inven",
             "backgrnd", "skilldex", "heads", "critters"]
 
@@ -365,17 +377,17 @@ class Controller:
                             for f in manifest["groups"][key]["frames"])
                         for key in manifest["groups"])
                     compatible = render_matches(str(adopted / "upscaled" / name), str(snapshot), 4,
-                                                Comfy(prompt=ANIMATION_PROMPT if animation else PROMPT))
+                                                production_model(animated=animation))
                     receipt[name] = {"origin": str(up.resolve()), "sha256": file_digest(adopted / "upscaled" / name),
                                      "settings": SETTINGS if compatible else "historical_mixed_or_unknown",
-                                     "all_full": compatible, "prompt": "animation" if animation else "art",
-                                     "full_compatible": compatible,
+                                     "all_lightning": compatible, "prompt": "animation" if animation else "art",
+                                     "lightning_compatible": compatible,
                                      "embedded_prompt": embedded}
                     atomic_json(adopted / "provenance.json", receipt)
                 except (OSError, ValueError):
                     continue
             # Recut on restart, so partial cuts never become an acceptance marker.
-            if receipt[name].get("full_compatible"):
+            if receipt[name].get("lightning_compatible"):
                 sheets.cut_sheet(str(adopted / "sheets" / name), str(adopted / "upscaled" / name), str(adopted))
         return adopted / "hd", receipt
 
@@ -417,15 +429,40 @@ class Controller:
             atomic_copy(src, dst)
         output = job / "upscaled" / name
         done = read_json(job / "cut.json")
-        if not (done and output.is_file() and file_digest(output) == done.get("sha256")):
+        model = production_model(seed, item["prompt"] == "animation")
+        valid_graph = (output.is_file() and render_matches(str(output), str(src),
+                                                          SETTINGS["render_scale"], model))
+        # A crash after PNG generation but before cut.json is recoverable
+        # without a second GPU invocation. Never forgive a mismatched hash.
+        trustworthy = valid_graph and (not done or done.get("sha256") == file_digest(output))
+        compatible = trustworthy and done and done.get("settings") == SETTINGS
+        if trustworthy and not compatible:
+            atomic_json(job / "cut.json", {"sha256": file_digest(output), "settings": SETTINGS,
+                                          "prompt": item["prompt"], "seed": seed})
+            compatible = True
+        if not compatible:
             print(f"production: seed={seed} sheet={name} prompt={item['prompt']}", flush=True)
-            self.command(["upscale", "--work", job, "--backend", "qwen", "--quality", "full",
-                          "--steps", "30", "--seed", str(seed), "--render-scale", "4",
-                          "--prompt", item["prompt"], "--comfy", self.args.comfy], job / "command.json", gpu=True)
+            # command.json='ok' cannot be reused to regenerate a missing or
+            # invalid PNG. Archive the whole old attempt before resetting the
+            # budget; never delete a historical image, checkpoint or log.
+            checkpoint = job / "command.json"
+            if read_json(checkpoint, {}).get("status") == "ok":
+                stale = job / "stale" / str(time.time_ns())
+                stale.mkdir(parents=True)
+                for previous in (checkpoint, Path(str(checkpoint) + ".log"), job / "cut.json",
+                                 output, Path(str(output) + ".render.json")):
+                    if previous.exists():
+                        previous.rename(stale / previous.name)
+            self.command(["upscale", "--work", job, "--backend", SETTINGS["backend"],
+                          "--quality", SETTINGS["quality"], "--steps", str(SETTINGS["steps"]),
+                          "--seed", str(seed), "--render-scale", str(SETTINGS["render_scale"]),
+                          "--prompt", item["prompt"], "--comfy", self.args.comfy], checkpoint, gpu=True)
             with Image.open(output) as image, Image.open(src) as native:
                 image.load()
                 if image.size != (native.width * 4, native.height * 4):
                     raise RuntimeError(f"invalid render dimensions: {output}")
+            if not render_matches(str(output), str(src), SETTINGS["render_scale"], model):
+                raise RuntimeError(f"render graph does not match Lightning production settings: {output}")
             atomic_json(job / "cut.json", {"sha256": file_digest(output), "settings": SETTINGS,
                                           "prompt": item["prompt"], "seed": seed})
         sheets.cut_sheet(str(src), str(output), str(attempt))
@@ -536,9 +573,9 @@ class Controller:
                     # restart can snapshot new legacy completions.
                     if all((source / f["rel"]).exists() for f in manifest["groups"][key]["frames"]):
                         self.accept(work, state, key, manifest["groups"][key], frames, processed,
-                                    {"kind": "adopted", "all_full": True,
+                                    {"kind": "adopted", "all_lightning": True,
                                      "receipt": str(work / "adopted" / "provenance.json"),
-                                     "note": "Full graph certified for this direction; other historical renders may be mixed/unknown"}, raw_source=source)
+                                     "note": "Lightning graph certified for this direction; other historical renders may be mixed/unknown"}, raw_source=source)
                         state["groups"][key]["adoption"] = True
         for index, seed in enumerate(self.args.seeds):
             attempt = work / f"attempt-{index:02d}"
@@ -559,7 +596,7 @@ class Controller:
                 for key in wanted:
                     self.accept(work, state, key, manifest["groups"][key], frames, processed,
                                 {"kind": "generated", "settings": SETTINGS, "seed": seed,
-                                 "attempt": index, "all_full": True}, raw_source=attempt / "hd")
+                                 "attempt": index, "all_lightning": True}, raw_source=attempt / "hd")
             except TimeoutError:
                 raise  # unavailable/busy server: wrapper may retry without consuming a seed
             except (RuntimeError, ValueError, OSError) as exc:
@@ -637,7 +674,7 @@ class Controller:
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--root", default="/ai/wasteland-hd/production")
+    p.add_argument("--root", default="/ai/wasteland-hd/production-lightning4")
     p.add_argument("--game")
     p.add_argument("--adopt-world")
     p.add_argument("--status", action="store_true", help="read saved report only; never contact ComfyUI")

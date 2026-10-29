@@ -5,13 +5,18 @@ Run from the tools checkout with the player's readable Fallout 2 data:
 ```sh
 python3 -u -m wasteland_hd.production \
   --game /home/yan/fallout2/gamedata \
-  --root /ai/wasteland-hd/production \
+  --root /ai/wasteland-hd/production-lightning4 \
   --adopt-world /ai/wasteland-hd/batch4/world
 ```
 
 The controller writes only its production root. It does not manage services,
 stop another runner, install assets, commit, delete Git content, or publish.
-The operator must stop the legacy controller before handing over GPU ownership.
+The older `/ai/wasteland-hd/production` controller still belongs to the
+historical full-Qwen workflow. **Never point the Lightning controller at that
+root or start it alongside the old GPU controller.** Hand over only after the
+existing GPU workload has finished or has been cleanly stopped by its owner.
+The default root is `/ai/wasteland-hd/production-lightning4`; its plan version
+and immutable settings prevent accidental resume with a different workflow.
 An advisory file lock prevents two controllers using the same production root.
 Different roots do not share that lock; coordinate GPU ownership externally.
 Before each new GPU command it waits for a healthy ComfyUI and an empty queue,
@@ -21,9 +26,9 @@ lock on the ComfyUI server.
 Inspection commands never write or use the GPU:
 
 ```sh
-python3 -m wasteland_hd.production --root /ai/wasteland-hd/production --status
+python3 -m wasteland_hd.production --root /ai/wasteland-hd/production-lightning4 --status
 python3 -m wasteland_hd.production --game /home/yan/fallout2/gamedata \
-  --root /ai/wasteland-hd/production --adopt-world /ai/wasteland-hd/batch4/world --dry-run
+  --root /ai/wasteland-hd/production-lightning4 --adopt-world /ai/wasteland-hd/batch4/world --dry-run
 ```
 
 `--status` reads the last atomic report; it is safe while the controller runs.
@@ -58,8 +63,19 @@ A single exceptionally large animation can still exceed typical memory needs.
 
 ## Rendering, adoption and rejection
 
-New renders use Qwen full **30 steps, cfg 4, no Lightning, render scale 4**,
-then cut down to 2x output. Native sheets default to **256**. Oversize source
+New production renders use **Qwen Image Edit 2511 Lightning 8-step**, LoRA
+`Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors` at strength 1,
+**8 Euler/simple steps, cfg 1, seed 42, AuraFlow shift 3, denoise 1**, and
+Lanczos input scaling. Loaders are `qwen_image_edit_2511_fp8mixed.safetensors`,
+`qwen_2.5_vl_7b_fp8_scaled.safetensors`, and `qwen_image_vae.safetensors`.
+PROMPT, ANIMATION_PROMPT and NEGATIVE from `wasteland_hd/upscale.py` are pinned
+by SHA256 in the production plan and verified against each PNG's ComfyUI graph.
+Native sheets are **256**, Qwen renders at **4×**, and final RGBA frame output
+is cut down to **2×**, with alpha copied by exact nearest-neighbour scaling.
+The model/scale/seed settings are verified before a generated PNG can be cut.
+The `upscale --quality full/auto` CLI modes remain for explicit experimental
+use only; the durable production controller always selects Lightning, for
+animations as well as static sheets. Oversize source
 sprites necessarily use larger sheets, as in `sheets.pack`; that exception
 can still cause model placement drift. Animated art and every critter use
 `by_animation=True` packing and the animation prompt. Very long directions
@@ -91,13 +107,13 @@ semantic fidelity or costume consistency.
 
 Adoption snapshots completed legacy sheets into each job's `adopted/`, retains
 their original PNG metadata, hashes and paths, and never modifies legacy work.
-Only full-compatible graphs validated by `upscale.render_matches` enter the
-accepted pipeline: 30 steps, cfg 4, seed 42, render4, no Lightning, matching
-art/animation prompt. Legacy animations with generic prompts are regenerated.
-Lightning, missing metadata, incomplete sheets and missing directions require
-fresh source-derived attempts. Full-compatible accepted directions have
-`all_full=true`; unverified/mixed historical snapshots retain explicit
-`historical_mixed_or_unknown` provenance and are never certified as full.
+Only exact Lightning-compatible graphs validated by `upscale.render_matches`
+enter the accepted pipeline: 8 steps, cfg 1, seed 42, render4, Lightning LoRA,
+the correct art/animation and negative prompts, sampler, scheduler, shift, model
+loaders and LoRA strength. Full-Qwen, missing metadata, incomplete sheets and
+missing directions require fresh source-derived attempts. Certified adopted
+directions have `all_lightning=true`; unverified/mixed historical snapshots
+retain `historical_mixed_or_unknown` provenance and are never certified.
 Per-sheet CLI skip validation is also used for newly generated work.
 
 ## Durable state and artifacts
@@ -115,6 +131,11 @@ local `staging/`. Every job has:
 - `attempt-NN/`: sheets, cut candidates, CPU stages and per-sheet command logs.
   `command.json` records durable invocation budgets; `cut.json` records completed
   render hashes. Restarting reuses completed renders and rechecks accepted files.
+  If generation succeeded but `cut.json` was interrupted, an intact matching
+  PNG is certified without another GPU call. If a previously successful render
+  is missing, corrupt, or has the wrong graph/hash, the old evidence (including
+  its command checkpoint and log) is moved into `renders/NAME/stale/TIMESTAMP/`
+  before a fresh bounded invocation. No mismatched PNG is silently adopted.
 - `hd/`: accepted outputs only. Atomic state is authoritative during a crash;
   an interrupted direction copy can leave files that have not been accepted yet.
 
