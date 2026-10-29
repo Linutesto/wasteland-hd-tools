@@ -295,3 +295,10 @@ if self.args.temporal and (hd / "art" / "critters").exists():
   by keyframe anchoring at all; they are what the fallback is for.
 * `rim` (diagnostic, not gated) stays high-ish (1.8-6.1 after) because the outline band carries the
   model's one-pixel motion bleed; it is not part of the verdict.
+
+## Owner review (2026-10-29)
+
+Yan watched the before/after GIFs (`http://100.75.11.55:8844/critter-temporal/`) and approved the
+"after" animations. Next: production integration behind `--temporal` (docs/FREEBUFF-TASK-CRITTER-PRODUCTION.md),
+then lift `~/fallout2/tools/hd-critter-guard.sh`. `hfprimab` stays a semantic no-go (wrong identity),
+which the temporal stage cannot fix.
