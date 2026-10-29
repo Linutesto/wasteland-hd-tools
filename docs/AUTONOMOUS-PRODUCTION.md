@@ -194,3 +194,26 @@ python3 -m pytest -q
 
 The controller tests mock subprocess generation and HTTP readiness. They do
 not start GPU jobs, modify legacy data or prove visual quality.
+
+## Repair pass
+
+`python3 -m wasteland_hd.repair --root PRODUCTION_ROOT --out REPAIR_ROOT --audit-only`
+rescans completed jobs with the CPU invention gate and writes only
+`REPAIR_ROOT/report.json`. The gate measures absent edges at native and 2×
+resolution, connected novel regions, damage to originally flat areas, tile
+border drift, and extra seam contrast for tile pairs placed next to each other
+in the game's map grids. Real map adjacency is cached in the repair root during
+a repair run. `minor_invention` remains accepted and is marked in coverage;
+`invented_texture` and `unmatched_floor` require repair.
+
+Without `--audit-only`, the separate repair root gets resumable, bounded
+Lightning attempts at denoise 0.55 then 0.4, each certified by its PNG graph
+and checked by integrity, existing QA and the invention gate. Unmatched floors
+can then receive a feathered source border. Remaining floors use the safe
+`source_floor_2x` fallback; other failed directions are omitted from the new
+pack. Its `jobs/JOB/hd/` contains overrides, and `staging/JOB.zip` copies the
+production pack with overrides and failed directions removed. `coverage.json`
+and the ZIP receipt record verdicts, fallbacks and hashes. Every pack remains
+pending human review. The repair controller reads production files only and
+waits for the existing ComfyUI readiness check before each GPU call. Queue
+readiness is not a server-wide reservation; coordinate concurrent controllers.
