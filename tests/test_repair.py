@@ -35,6 +35,7 @@ def fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(repair,'Game',lambda game: SimpleNamespace())
     monkeypatch.setattr(repair.qa,'original_frame',lambda game,cache,r:original)
     monkeypatch.setattr(repair.invention,'cached_adjacency',lambda *a,**kw:[])
+    monkeypatch.setattr(repair.invention,'cached_wall_pairs',lambda *a,**kw:[])
     return root,out,job,rel,original,bad
 
 
@@ -357,3 +358,138 @@ def test_sprite_direction_gates_by_kind_and_falls_back_to_original_art(tmp_path,
     assert result['fallback'] == 'original_game_art'
     with Image.open(out/'jobs'/'scenery-0000'/'hd'/rel) as saved:
         assert list(saved.getdata()) == list(good.getdata())
+
+
+def _wall_fixture(tmp_path, monkeypatch):
+    """Two touching wall directions; wa's art breaks the junction the source does not."""
+    from wasteland_hd import repair as r
+
+    def brick():
+        image = Image.new('RGBA', (40, 60), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, 39, 59), fill=(150, 130, 110, 255))
+        for y in range(0, 60, 6):
+            draw.rectangle((0, y, 39, y + 1), fill=(110, 90, 75, 255))
+        return image
+
+    wa, wb = 'art/walls/wa/0_0.png', 'art/walls/wb/0_0.png'
+    originals = {wa: brick(), wb: brick()}
+    good = {rel: im.resize((80, 120), Image.Resampling.NEAREST) for rel, im in originals.items()}
+    # The break: wa's contact edge is much brighter than anything the source shows.
+    bad = good[wa].copy()
+    pixels = bad.load()
+    for x in range(72, 80):
+        for y in range(120):
+            red, green, blue, alpha = pixels[x, y]
+            if alpha:
+                pixels[x, y] = (min(255, red + 75), min(255, green + 75), min(255, blue + 75), alpha)
+    root, out = tmp_path / 'production', tmp_path / 'repair'
+    root.mkdir()
+    (root / 'plan.json').write_text(json.dumps({'game': 'fixture'}))
+    groups, works = {}, {}
+    for job, rel, image in (('walls-0000', wa, bad), ('walls-0001', wb, good[wb])):
+        work = tmp_path / job
+        target = work / 'hd' / rel
+        target.parent.mkdir(parents=True)
+        image.save(target)
+        expected = {'rel': rel, 'width': 80, 'height': 120,
+                    'alpha': digest(image.getchannel('A').tobytes())}
+        key = rel.rsplit('/', 1)[0] + '/0'
+        group = {'art': rel.rsplit('/', 1)[0] + '.frm', 'direction': 0,
+                 'frames': [expected], 'animated': False}
+        groups[key] = group
+        works[key] = work
+        (work / 'inventory.json').write_text(json.dumps({'groups': {key: group}}))
+        (work / 'state.json').write_text(json.dumps(
+            {'status': 'needs_review', 'groups': {key: {'complete': False}}}))
+        (work / 'coverage.json').write_text('{"status":"needs_review"}')
+    junction = {'map': 'walls.map', 'elevation': 0,
+                'a': {'rel': wa, 'x': 0, 'y': 0, 'w': 40, 'h': 60},
+                'b': {'rel': wb, 'x': 40, 'y': 0, 'w': 40, 'h': 60},
+                'dx': 40, 'dy': 0, 'same': False, 'contact': 60}
+    monkeypatch.setattr(r, 'Game', lambda game: SimpleNamespace())
+    monkeypatch.setattr(r.qa, 'original_frame', lambda game, cache, rel: originals[rel])
+    monkeypatch.setattr(r.invention, 'cached_adjacency', lambda *a, **kw: [])
+    monkeypatch.setattr(r.invention, 'cached_wall_pairs', lambda *a, **kw: [junction])
+    calls = []
+
+    def fake_render(self, job_name, key, group, step, denoise):
+        calls.append(denoise)
+        dest = out / f'candidate-{job_name}-{step}'
+        rel = group['frames'][0]['rel']
+        path = dest / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        (bad if rel == wa else good[rel]).save(path)
+        return dest, {'kind': 'reduced_denoise', 'denoise': denoise}
+
+    monkeypatch.setattr(r.Controller, 'render', fake_render)
+    return SimpleNamespace(root=root, out=out, wa=wa, wb=wb, good=good, bad=bad,
+                           originals=originals, groups=groups, works=works, calls=calls)
+
+
+def _columns(image, x0, x1=None):
+    """Pixels of an 80x120 2x frame between columns x0 and x1."""
+    data = list(image.convert('RGBA').getdata())
+    return [data[y * 80 + x] for y in range(120) for x in range(x0, x1 or 80)]
+
+
+def test_wall_junction_enters_ladder_and_locks_before_fallback(tmp_path, monkeypatch):
+    fx = _wall_fixture(tmp_path, monkeypatch)
+    controller = repair.Controller(fx.root, fx.out)
+    controller.seam_index()
+    # The neighbour shipped earlier, so the gate can see the junction now.
+    controller.hd_index[fx.wb] = fx.works['art/walls/wb/0'] / 'hd' / fx.wb
+    key = 'art/walls/wa/0'
+    result = controller.process_group(fx.works[key], key, fx.groups[key], False)
+    assert fx.calls == [0.55, 0.4], 'an unmatched junction re-enters the denoise ladder'
+    assert result['accepted']
+    assert result['fallback'] == 'junction_lock'
+    assert result['gate']['frames'][fx.wa]['verdict'] != 'unmatched_wall'
+    with Image.open(fx.out / 'jobs' / 'walls-0000' / 'hd' / fx.wa) as saved:
+        # The junction band is exactly the source art again; the rest is HD,
+        # with a feather only in the 10 px between them.
+        assert _columns(saved, 74) == _columns(fx.good[fx.wa], 74)
+        assert _columns(saved, 0, 60) == _columns(fx.bad, 0, 60)
+
+
+def test_reconciliation_checks_a_junction_the_ladder_never_saw(tmp_path, monkeypatch):
+    from wasteland_hd import invention
+    fx = _wall_fixture(tmp_path, monkeypatch)
+    controller = repair.Controller(fx.root, fx.out)
+    controller.seam_index()
+    key_a, key_b = 'art/walls/wa/0', 'art/walls/wb/0'
+    # Neither neighbour is accepted yet when either direction is processed, so
+    # the ladder cannot see the junction; only reconciliation can.
+    result_a = controller.process_group(fx.works[key_a], key_a, fx.groups[key_a], False)
+    result_b = controller.process_group(fx.works[key_b], key_b, fx.groups[key_b], False)
+    assert result_a['accepted'] and result_b['accepted']
+    assert result_a['fallback'] is None
+    manifest_a = {'groups': {key_a: fx.groups[key_a]}}
+    manifest_b = {'groups': {key_b: fx.groups[key_b]}}
+    jobs = [(fx.works[key_a], {'groups': {}}, manifest_a),
+            (fx.works[key_b], {'groups': {}}, manifest_b)]
+    results = {(fx.works[key_a].name, key_a): result_a,
+               (fx.works[key_b].name, key_b): result_b}
+    controller.reconcile_walls(jobs, results)
+    updated = results[(fx.works[key_a].name, key_a)]
+    assert updated['fallback'] == 'junction_lock', 'the shipped junction is corrected'
+    with Image.open(fx.out / 'jobs' / 'walls-0000' / 'hd' / fx.wa) as saved_a:
+        assert _columns(saved_a, 74) == _columns(fx.good[fx.wa], 74)
+        with Image.open(controller.hd_index[fx.wb]) as saved_b:
+            delta = invention.wall_seam_delta(saved_a, saved_b, fx.originals[fx.wa],
+                                              fx.originals[fx.wb], {'dx': 40, 'dy': 0})
+    assert delta <= invention.WALL_SEAM_DELTA_LIMIT
+
+
+def test_junction_lock_leaves_a_clean_frame_untouched(tmp_path):
+    original = Image.new('RGBA', (20, 20), (100, 90, 80, 255))
+    hd = original.resize((40, 40), Image.Resampling.NEAREST)
+    band = None
+    assert list(repair.junction_lock(hd, original, band).getdata()) == list(hd.getdata())
+    import numpy as np
+    mask = np.zeros((40, 40), bool)
+    mask[:, 38:] = True
+    locked = repair.junction_lock(hd, original, mask)
+    assert list(locked.getdata())[:38 * 40] == list(hd.getdata())[:38 * 40]
+    assert list(locked.getdata())[38 * 40:] == list(original.resize((40, 40),
+    Image.Resampling.NEAREST).getdata())[38 * 40:]

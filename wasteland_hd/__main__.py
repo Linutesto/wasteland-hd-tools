@@ -372,6 +372,9 @@ def cmd_install(args):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'select':
+        from .select import main as select_main
+        return select_main(sys.argv[2:])
     ap = argparse.ArgumentParser(prog="wasteland-hd", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("manifest", help="add a pack to packs.json")

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,10 @@ from .upscale import Comfy, render_matches, write_render_receipt, LIGHTNING, PRO
 
 DENOISE_LADDER = (0.55, 0.4)
 REPAIR_SEEDS = (1009, 1013)
+# Wall junction deltas are keyed by both frames' digests, so a steady-state
+# run only re-measures junctions whose art actually changed.
+WALL_SEAM_CACHE_MAX = 400_000
+WALL_SEAM_CACHE = 'wall-seam-cache.json'
 
 
 class RepairModel(Comfy):
@@ -53,6 +58,32 @@ def edge_lock(hd, source, width=12):
     return Image.fromarray(np.dstack((rgb,b[..., 3].astype('uint8'))))
 
 
+def junction_lock(hd, source, band, width=10):
+    """Pull a wall's junction band back to the original art, feathering inward.
+
+    `band` is the frame's own junction mask at 2x (invention.wall_junction_mask).
+    At the contact the frame is exactly the source art again, so the two sides
+    of a junction cannot disagree there; `width` px inward the HD texture takes
+    over unchanged. Alpha is untouched: it is already the original's.
+    """
+    import numpy as np
+    from scipy.ndimage import distance_transform_edt
+    a = np.asarray(hd.convert('RGBA'), np.float32)
+    b = np.asarray(source.resize(hd.size, Image.Resampling.NEAREST), np.float32)
+    if a.shape != b.shape:
+        raise ValueError('junction lock needs matching sizes')
+    if band is None or not band.any():
+        return hd.copy()
+    if band.shape != a.shape[:2]:
+        raise ValueError('junction band must match the 2x frame')
+    distance = distance_transform_edt(~band)
+    weight = np.clip(distance / max(width, 1), 0, 1)
+    weight = weight * weight * (3 - 2 * weight)
+    rgb = np.clip(np.rint(b[..., :3] * (1 - weight[..., None]) + a[..., :3] * weight[..., None]),
+                  0, 255).astype('uint8')
+    return Image.fromarray(np.dstack((rgb, a[..., 3].astype('uint8'))))
+
+
 class Controller:
     def __init__(self, root, out, *, audit_only=False, comfy='http://127.0.0.1:8188',
                  ready_timeout=600, command_retries=2):
@@ -73,6 +104,10 @@ class Controller:
         self.originals = {}
         self.hd_index = {}
         self.seams = {}
+        self.wall_seams = {}
+        self.wall_junctions = []
+        self.wall_delta_cache = None
+        self.file_digests = {}
 
     def jobs(self):
         for work in sorted((self.root/'jobs').iterdir()):
@@ -102,8 +137,47 @@ class Controller:
                 by_rel[a].append((a,b,side))
                 by_rel[b].append((a,b,side))
         self.seams = by_rel
+        # Walls: every pair of wall sprites whose placed alphas touch, keyed
+        # both as a junction list (reconciliation) and per frame (the gate).
+        walls = defaultdict(list)
+        seen = set()
+        for p in invention.cached_wall_pairs(self.game, self.out, write=not self.audit_only):
+            a, b = p['a']['rel'], p['b']['rel']
+            key = (a, b, p['dx'], p['dy'])
+            if key in seen:
+                continue  # the same junction repeats across maps; it measures the same
+            seen.add(key)
+            placement = {'dx': p['dx'], 'dy': p['dy']}
+            self.wall_junctions.append((a, b, placement))
+            walls[a].append((a, b, placement))
+            walls[b].append((b, a, {'dx': -p['dx'], 'dy': -p['dy']}))
+        self.wall_seams = walls
+        if self.wall_delta_cache is None:
+            self.wall_delta_cache = read_json(self.out/WALL_SEAM_CACHE) or {}
+
+    def _digest(self, path, refresh=False):
+        key = str(path)
+        if refresh or key not in self.file_digests:
+            self.file_digests[key] = file_digest(path)
+        return self.file_digests[key]
+
+    def wall_delta(self, rel_a, image_a, digest_a, rel_b, image_b, digest_b, placement):
+        """Wall junction delta, memoised on both frames' content digests."""
+        if self.wall_delta_cache is None:
+            self.wall_delta_cache = {}
+        key = f'{rel_a}|{digest_a}|{rel_b}|{digest_b}|{placement["dx"]},{placement["dy"]}'
+        hit = self.wall_delta_cache.get(key)
+        if hit is not None:
+            return hit
+        delta = invention.wall_seam_delta(image_a, image_b, self.original(rel_a),
+                                          self.original(rel_b), placement)
+        if len(self.wall_delta_cache) < WALL_SEAM_CACHE_MAX:
+            self.wall_delta_cache[key] = delta
+        return delta
 
     def seam_for(self, rel, hd, overrides=None):
+        if rel.startswith('art/walls/'):
+            return self.wall_seam_for(rel, hd)
         if not rel.startswith('art/tiles/'):
             return 0.0
         worst = 0.0
@@ -121,6 +195,44 @@ class Controller:
                 except (ValueError, OSError):
                     continue
         return worst
+
+    def wall_seam_for(self, rel, hd):
+        """Worst wall junction delta for this frame against its accepted neighbours."""
+        worst = 0.0
+        digest = hashlib.sha256(hd.tobytes()).hexdigest()
+        opened = {}
+        for _self, other, placement in self.wall_seams.get(rel, []):
+            if other == rel:
+                # A repeat of this very frame: measure it against itself.
+                other_hd, other_digest = hd, digest
+            else:
+                path = self._hd(other)  # neighbours count only once accepted
+                if path is None:
+                    continue
+                if path not in opened:
+                    opened[path] = Image.open(path)
+                other_hd = opened[path]
+                other_digest = self._digest(path)
+            try:
+                delta = self.wall_delta(rel, hd, digest, other, other_hd,
+                                        other_digest, placement)
+                worst = max(worst, delta)
+            except (ValueError, OSError):
+                continue
+        for handle in opened.values():
+            handle.close()
+        return worst
+
+    def wall_band(self, rel):
+        """This frame's own junction bands (2x), from its placements' original art."""
+        junctions = [(placement, self.original(other))
+                     for _self, other, placement in self.wall_seams.get(rel, [])]
+        if not junctions:
+            return None
+        try:
+            return invention.wall_junction_mask(self.original(rel), junctions)
+        except (ValueError, OSError):
+            return None
 
     def gate(self, work, group, source, *, overrides=None):
         """Whole direction: integrity, existing QA, then invention/seam gate."""
@@ -145,7 +257,7 @@ class Controller:
                                          kind=invention.kind_of(rel))
                 score['qa_badness'] = round(float(bad), 5)
                 result['frames'][rel] = score
-                if score['verdict'] in ('invented_texture','unmatched_floor'):
+                if score['verdict'] in ('invented_texture','unmatched_floor','unmatched_wall'):
                     result['issues'][rel] = score['verdict']
         result['complete'] = not result['issues']
         return result
@@ -385,6 +497,46 @@ class Controller:
                 if measured['complete']:
                     source, method = fixed, {'kind':'edge_lock','source':str(candidate)}
                     break
+        if source is None and group['art'].startswith('art/walls/'):
+            # Junction correction before falling back on the whole direction:
+            # pull each unmatched junction band back to the original art and
+            # re-gate. Only a candidate whose issues are all unmatched_wall
+            # qualifies; invented interiors cannot be blended away.
+            legacy_candidates = [self.out/'jobs'/job/'attempts'/key/f'denoise-{i}'/'candidate'/'hd'
+                                 for i in range(len(DENOISE_LADDER))]
+            pending = None
+            for candidate in [original_source] + candidates + legacy_candidates:
+                if candidate is None or not all((candidate/f['rel']).is_file() for f in group['frames']):
+                    continue
+                measured = self.gate(work, group, candidate)
+                last = measured
+                verdicts = [v['verdict'] for v in measured['frames'].values()]
+                if 'unmatched_wall' not in verdicts:
+                    continue
+                if any(v in ('invented_texture', 'unmatched_floor') for v in verdicts):
+                    continue
+                images = []
+                for f in group['frames']:
+                    with Image.open(candidate/f['rel']) as hd:
+                        band = (self.wall_band(f['rel'])
+                                if measured['frames'][f['rel']]['verdict'] == 'unmatched_wall'
+                                else None)
+                        images.append(junction_lock(hd, self.original(f['rel']), band))
+                fixed = self._save_images(job, group, images, 'junction-lock')
+                measured = self.gate(work, group, fixed)
+                last = measured
+                if measured['complete']:
+                    source, method = fixed, {'kind':'junction_lock', 'source':str(candidate)}
+                    break
+                if pending is None and set(measured.get('issues', {}).values()) == {'unmatched_wall'}:
+                    # The junction still does not clear: the other side may be
+                    # the culprit (or neither side can fix it alone). Keep this
+                    # side's source-exact band; reconcile_walls re-checks the
+                    # junction once both frames ship and corrects the culprit.
+                    pending = (fixed, {'kind':'junction_lock', 'source':str(candidate),
+                                       'unmatched_neighbour':True}, measured)
+            if source is None and pending is not None:
+                source, method, last = pending
         if source is None and group['art'].startswith('art/tiles/'):
             images = [source_floor_2x(self.original(f['rel'])) for f in group['frames']]
             fallback = self._save_images(job, group, images, 'source-floor')
@@ -403,16 +555,19 @@ class Controller:
             last = self.gate(work, group, fallback)
             if last['complete']:
                 source, method = fallback, {'kind':'original_game_art'}
-        accepted = source is not None and last['complete']
+        accepted = source is not None and (last['complete'] or
+                                           bool(method and method.get('unmatched_neighbour')))
         if accepted:
             for f in group['frames']:
                 atomic_copy(source/f['rel'], self.out/'jobs'/job/'hd'/f['rel'])
         if accepted:
             for f in group['frames']:
-                self.hd_index[f['rel']] = self.out/'jobs'/job/'hd'/f['rel']
+                path = self.out/'jobs'/job/'hd'/f['rel']
+                self.hd_index[f['rel']] = path
+                self._digest(path, refresh=True)
         result = {'source':str(source) if source else None, 'gate':last,
                   'hashes': {f['rel']:file_digest(self.out/'jobs'/job/'hd'/f['rel']) for f in group['frames']} if accepted else {},
-                  'fallback':method['kind'] if method and method['kind'] in ('edge_lock','source_floor_2x','original_game_art') else None,
+                  'fallback':method['kind'] if method and method['kind'] in ('edge_lock','source_floor_2x','original_game_art','junction_lock') else None,
                   'provenance':method, 'accepted':accepted}
         state['groups'][key] = result
         atomic_json(state_path, state)
@@ -514,20 +669,140 @@ class Controller:
                         prepared=outcomes[(work.name, key)], initial=initials[(work.name, key)])
         return resolved
 
+    def _repair_wall_group(self, rel, groups, results):
+        """Move one wall direction forward: junction lock once, then original art.
+
+        Returns True when the group's shipped frame changed. The steps only
+        ever move the frame closer to the source art, so repeated rounds
+        converge instead of oscillating.
+        """
+        work, key, group = groups[rel]
+        job = work.name
+        entry = results[(job, key)]
+        if not entry.get('accepted'):
+            return False
+        source = entry.get('source')
+        if source == 'production':
+            source = self.candidate_from_production(work, group)
+        if source is None:
+            return False
+        candidate = Path(source)
+        images = None
+        provenance = None
+        name = None
+        if candidate.name != 'junction-lock':
+            # Already locked once: locking again from the locked result is the
+            # same image, so go straight to the fallback below.
+            images = []
+            for f in group['frames']:
+                with Image.open(candidate/f['rel']) as hd:
+                    images.append(junction_lock(hd, self.original(f['rel']), self.wall_band(f['rel'])))
+            provenance = {'kind':'junction_lock', 'source':str(candidate)}
+            name = 'junction-lock'
+        fixed = self._save_images(job, group, images, name) if images is not None else None
+        measured = self.gate(work, group, fixed) if fixed is not None else {'complete': False}
+        if not measured.get('complete'):
+            # Untouched game art matches every neighbour's source art by
+            # construction, which is the only junction that cannot rematch.
+            images = [self.original(f['rel']).resize((self.original(f['rel']).width*2,
+                                                      self.original(f['rel']).height*2),
+                                                     Image.Resampling.NEAREST)
+                      for f in group['frames']]
+            fixed = self._save_images(job, group, images, 'original-art')
+            measured = self.gate(work, group, fixed)
+            provenance = {'kind':'original_game_art'}
+        if not measured.get('complete'):
+            return False
+        for f in group['frames']:
+            atomic_copy(fixed/f['rel'], self.out/'jobs'/job/'hd'/f['rel'])
+            self.hd_index[f['rel']] = self.out/'jobs'/job/'hd'/f['rel']
+            self._digest(self.out/'jobs'/job/'hd'/f['rel'], refresh=True)
+        updated = dict(entry)
+        updated.update({
+            'source': str(fixed), 'gate': measured, 'accepted': True,
+            'hashes': {f['rel']: file_digest(self.out/'jobs'/job/'hd'/f['rel'])
+                       for f in group['frames']},
+            'fallback': provenance['kind'] if provenance['kind'] in ('junction_lock', 'original_game_art')
+                        else entry.get('fallback'),
+            'provenance': provenance,
+        })
+        results[(job, key)] = updated
+        state_path = self.out/'jobs'/job/'state.json'
+        state = read_json(state_path, {'groups': {}})
+        state['groups'][key] = updated
+        atomic_json(state_path, state)
+        return True
+
+    def reconcile_walls(self, jobs, results):
+        """Re-check every wall junction with the frames that will actually ship.
+
+        Directions are processed in job order, so a junction against a
+        neighbour accepted later was never measured by either side, and a
+        junction where one side fell back to original art is not the junction
+        the ladder saw. Measured here once both sides hold their final frame;
+        the side still carrying AI pixels is corrected, then (if that is not
+        enough) replaced by original art.
+        """
+        if not self.wall_junctions:
+            return results
+        groups = {}
+        for work, _state, manifest in jobs:
+            for key, group in manifest['groups'].items():
+                for f in group['frames']:
+                    groups[f['rel']] = (work, key, group)
+        for _round in range(8):
+            broken = []
+            for a, b, placement in self.wall_junctions:
+                if a not in self.hd_index or b not in self.hd_index:
+                    continue
+                if a not in groups or b not in groups:
+                    continue
+                try:
+                    with Image.open(self.hd_index[a]) as ia, Image.open(self.hd_index[b]) as ib:
+                        delta = self.wall_delta(a, ia, self._digest(self.hd_index[a]),
+                                                b, ib, self._digest(self.hd_index[b]), placement)
+                except (OSError, ValueError):
+                    continue
+                if delta > invention.WALL_SEAM_DELTA_LIMIT:
+                    broken.append((a, b))
+            if not broken:
+                return results
+            changed = set()
+            for a, b in broken:
+                for rel in (a, b):
+                    if rel in changed or rel not in groups:
+                        continue
+                    entry = results.get((groups[rel][0].name, groups[rel][1]))
+                    provenance = (entry or {}).get('provenance') or {}
+                    if provenance.get('kind') == 'original_game_art':
+                        continue  # already the source art; it cannot mismatch it
+                    if self._repair_wall_group(rel, groups, results):
+                        changed.add(rel)
+            if not changed:
+                return results
+        return results
+
     def _run_jobs(self,jobs):
         report = {'jobs': {}, 'summary': {}, 'audit_only': self.audit_only,
                   'production_root': str(self.root), 'verdict_examples': {}}
         examples = defaultdict(list)
         total = Counter()
         batched = {} if self.audit_only else self._batch_jobs(jobs)
+        resolved = {}
         for work,state,manifest in jobs:
-            results = {}
-            counts = Counter()
             for key,group in manifest['groups'].items():
                 accepted = bool(state['groups'].get(key,{}).get('complete'))
-                result = (self.process_group(work,key,group,accepted) if self.audit_only
-                          else batched[(work.name, key)])
-                results[key] = result
+                resolved[(work.name, key)] = (self.process_group(work,key,group,accepted) if self.audit_only
+                                              else batched[(work.name, key)])
+        if not self.audit_only:
+            self.reconcile_walls(jobs, resolved)
+            if self.wall_delta_cache is not None:
+                atomic_json(self.out/WALL_SEAM_CACHE, self.wall_delta_cache)
+        for work,state,manifest in jobs:
+            results = {key: resolved[(work.name, key)] for key in manifest['groups']}
+            counts = Counter()
+            for key,group in manifest['groups'].items():
+                result = results[key]
                 gate = result['gate']
                 for rel,score in (gate or {}).get('frames',{}).items():
                     verdict = score['verdict']

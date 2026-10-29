@@ -2,7 +2,9 @@
 
 Brief: `docs/FREEBUFF-TASK-GATE-NONFLOOR.md` (rules from `docs/CODEX-TASK-GATE-NONFLOOR.md`).
 Work started by a Codex agent, finished by the previous Claude session, report written by this one.
-Nothing committed, per the brief.
+I did not commit: while this report was being finished the reviewing session committed the gate
+code plus an earlier snapshot of it as `a095e52` (13:14), so the corrections below are unstaged
+on top of that commit.
 
 ## Outcome
 
@@ -16,21 +18,22 @@ Nothing committed, per the brief.
   (5.48%) before → 123 (2.46%) after**; flagged (minor + invented) 307 (6.14%) → 251 (5.02%).
 - Tiles/floors are untouched: all 20 tile calibration labels from `docs/REPAIR-GATE-REPORT.md`
   still hold with byte-identical numbers, and the floor code path is unchanged.
-- Tests: gate files 18/18 green. Full suite `python3 -m pytest -q` = **93 passed, 8 failed**, and
-  every failure is in `tests/test_temporal_stage.py` — a separate, still-in-progress task
-  (`docs/FREEBUFF-TASK-CRITTER-TEMPORAL.md`, untracked files) that does not import
-  `invention`/`repair`. Details in *Tests* below.
+- Tests: gate files 18/18 green. Full suite `python3 -m pytest -q` = **101 passed, 0 failed**
+  (final run at 13:17). While this report was being written the suite showed `93 passed,
+  8 failed`, every failure in `tests/test_temporal_stage.py` — a different, still-in-progress
+  task (`docs/FREEBUFF-TASK-CRITTER-TEMPORAL.md`, untracked files) whose module imports no
+  `invention`/`repair` code; that session has since fixed it. Details in *Tests* below.
 
 ## What the per-kind rules do (`wasteland_hd/invention.py`)
 
 | Where | Rule |
 |---|---|
-| `KINDS`, `kind_of()` (`invention.py:27`, `:42-48`) | `art/{walls,scenery,items,misc}/...` maps to its own kind; anything else (tiles, interface, critters, unknown paths) returns `'tiles'` and therefore keeps the floor behaviour. |
+| `KINDS`, `kind_of()` (`invention.py:30`, `:42-47`) | `art/{walls,scenery,items,misc}/...` maps to its own kind; anything else (tiles, interface, critters, unknown paths) returns `'tiles'` and therefore keeps the floor behaviour. |
 | `score()` (`invention.py:142-151`) | Validates `kind`, raises on unknown ones; `sprite = kind != 'tiles'`; `floor` is forced off for sprites so `unmatched_floor` can never be produced for a sprite. |
-| Alpha-boundary band (`invention.py:66-78`) | The 4 px band (`SPRITE_BAND`) hugging the alpha boundary is ignored for novelty and flat damage — silhouette anti-aliasing is not invention. The band is only trusted when a core of at least `SPRITE_CORE_MIN=64` px *and* `SPRITE_CORE_SHARE=25%` of the mask survives it, otherwise it is disabled, so stroke art with no core at all (fences, grids, blades) still fails on wholly invented detail. |
-| Absolute evidence for tiny/thin frames (`_sprite_verdict`, `invention.py:124-141`) | With `mask_pixels < SPRITE_MIN_AREA=400` a ratio means nothing: require `novel_pixels >= SPRITE_MIN_PIXELS_TEXTURE=40` for `invented_texture`, `>= SPRITE_MIN_PIXELS=12` for `minor_invention`, else `clean`. Flat-area damage is ignored there (a bicubic-resized thin stroke reads as flat source, so faithful wires would fail everywhere). |
-| Emissive lift (`invention.py:99-105`) | Dark novelty is suppressed where the HD frame is at least `EMISSIVE_LIFT=25` brighter than the source over a neighbourhood: lamps, screens and other lit detail that gained glow are not "invented dark structure". |
-| Sprite thresholds (`invention.py:134-141`) | `invented_texture` if `novel_fraction > 0.08` or `largest_novel_region > 0.055` or (`flat_damage > 0.045` and cluster `> 0.03`) or `dark_novel > 0.05`; `minor_invention` if `novel_fraction > 0.04` or cluster `> 0.015`; else `clean`. Sprites also skip `border_error`/`seam_delta` (`invention.py:151`), which are floor-neighbourhood measures. |
+| Alpha-boundary band (`invention.py:72-83`) | The 4 px band (`SPRITE_BAND`) hugging the alpha boundary is ignored for novelty and flat damage — silhouette anti-aliasing is not invention. The band is only trusted when a core of at least `SPRITE_CORE_MIN=64` px *and* `SPRITE_CORE_SHARE=25%` of the mask survives it, otherwise it is disabled, so stroke art with no core at all (fences, grids, blades) still fails on wholly invented detail. |
+| Absolute evidence for tiny/thin frames (`_sprite_verdict`, `invention.py:121-139`) | With `mask_pixels < SPRITE_MIN_AREA=400` a ratio means nothing: require `novel_pixels >= SPRITE_MIN_PIXELS_TEXTURE=40` for `invented_texture`, `>= SPRITE_MIN_PIXELS=12` for `minor_invention`, else `clean`. Flat-area damage is ignored there (a bicubic-resized thin stroke reads as flat source, so faithful wires would fail everywhere). |
+| Emissive lift (`invention.py:98-103`) | Dark novelty is suppressed where the HD frame is at least `EMISSIVE_LIFT=25` brighter than the source over a neighbourhood: lamps, screens and other lit detail that gained glow are not "invented dark structure". |
+| Sprite thresholds (`invention.py:135-139`) | `invented_texture` if `novel_fraction > 0.08` or `largest_novel_region > 0.055` or (`flat_damage > 0.045` and cluster `> 0.03`) or `dark_novel > 0.05`; `minor_invention` if `novel_fraction > 0.04` or cluster `> 0.015`; else `clean`. Sprites also skip `border_error`/`seam_delta` (`invention.py:151,159`), which are floor-neighbourhood measures. |
 
 ## Wiring (`wasteland_hd/repair.py`)
 
@@ -204,18 +207,24 @@ policy but still worth watching).
 | misc | 335 | 75 (22.39%) | 81 (24.18%) | 5 (1.49%) | 43 (12.84%) |
 | **total** | **4,997** | **274 (5.48%)** | **307 (6.14%)** | **123 (2.46%)** | **251 (5.02%)** |
 
-Expected behaviour on the next production run over this material: ~123 of 4,997 non-floor frames
-retry instead of 274, and the ~128 frames that move from `invented_texture` to `minor_invention`
-or `clean` ship (minor additions are within Yan's policy). `misc` was the worst offender under
-floor thresholds (22% invented on small sprite sheets like knives, spears, explosions) and is now
-1.5%.
+Verdict transitions (before → after, 4,997 rows): `invented_texture → invented_texture` 123,
+`invented_texture → minor_invention` 101, `invented_texture → clean` 50,
+`minor_invention → minor_invention` 27, `minor_invention → clean` 6,
+`clean → clean` 4,690 — and **nothing moved towards failing** (no `clean` or `minor` became
+`invented_texture`).
+
+Expected behaviour on the next production run over this material: 123 of 4,997 non-floor frames
+retry instead of 274; 151 frames leave the retry bucket (101 into `minor_invention`, 50 into
+`clean`) and 6 more clear from `minor_invention` to `clean`, all within Yan's policy that small
+local additions are acceptable. `misc` was the worst offender under floor thresholds (22%
+invented on small sprite sheets like knives, spears, explosions) and is now 1.5%.
 
 ## Tiles behaviour unchanged
 
 - For `kind='tiles'`, `sprite` is `False`, so the new band is `np.zeros_like(mask)` and both
   `novel & ~band` and `damage & ~band` are no-ops; `dark_novel` is computed exactly as before;
   no sprite-only keys are added to the result; `floor`, `BORDER_ERROR_LIMIT`, `SEAM_DELTA_LIMIT`
-  and every floor threshold are untouched (`invention.py:148-166`).
+  and every floor threshold are untouched (`invention.py:148-168`).
 - The 20 tile calibration labels from `docs/REPAIR-GATE-REPORT.md` were rescored with the new
   code: `tmp-audit/nonfloor/tile-labels.txt` ends with **`ALL 20 CALIBRATION LABELS HOLD`** —
   10 `invented_texture`, 3 `minor_invention`, 7 `clean`, every metric identical before/after
@@ -231,7 +240,9 @@ floor thresholds (22% invented on small sprite sheets like knives, spears, explo
   `test_emissive_lift_is_not_dark_structure`, and
   `tests/test_repair.py::test_sprite_direction_gates_by_kind_and_falls_back_to_original_art`
   (covers the `original_game_art` fallback end to end).
-- Whole suite: `python3 -m pytest -q` → **93 passed, 8 failed**. The 8 failures are all in
+- Whole suite: `python3 -m pytest -q` → **101 passed, 0 failed** (rerun at 2026-10-29 13:17,
+  after the separate temporal task landed its own fix).
+- Earlier in this session the same command reported `93 passed, 8 failed`, all 8 in
   `tests/test_temporal_stage.py` (`test_static_noise_converges_and_stays_deterministic`,
   `test_colour_transfer_equalises_material_without_blurring_texture`,
   `test_static_copy_takes_the_keyframe_where_the_original_agrees`,
@@ -239,16 +250,17 @@ floor thresholds (22% invented on small sprite sheets like knives, spears, explo
   `test_direction_over_the_cap_falls_back_to_original_art`,
   `test_rejects_bad_alpha_and_dangerous_destinations`,
   `test_cli_writes_the_before_after_report`).
-  That file and `wasteland_hd/temporal_stage.py` are untracked work for a **different** task
-  (`docs/FREEBUFF-TASK-CRITTER-TEMPORAL.md`); `temporal_stage.py` imports only `PIL`, `numpy`,
-  `scipy.ndimage`, `gamefiles` etc. — no `invention`, no `repair` — and its failures are
-  threshold assertions on its own flicker/material metrics. 93 + 8 = 101 tests, minus that
-  file's 9 = the 92 tests that pass outside it. Excluding the unrelated temporal task, the
-  suite is green.
+  `wasteland_hd/temporal_stage.py` is untracked work for a **different** task
+  (`docs/FREEBUFF-TASK-CRITTER-TEMPORAL.md`) and imports only `PIL`, `numpy`, `scipy.ndimage`,
+  `gamefiles` etc. — no `invention`, no `repair` — so the gate change was never implicated; its
+  9 tests were fixed in that session, not here.
 
 ## Still open
 
 - The 5 conservative `clean → minor_invention` disagreements above; leave them as retries unless
   Yan prefers them shipping.
-- Nothing was committed; the working tree holds `invention.py`, `repair.py`,
-  `tests/test_invention.py`, `tests/test_repair.py` (plus the unrelated temporal task's files).
+- Nothing was committed by me; `a095e52` (reviewing session, 13:14) already holds
+  `invention.py`, `repair.py`, `tests/test_invention.py`, `tests/test_repair.py` and the first
+  snapshot of this report. Still unstaged: these report corrections plus the unrelated temporal
+  task's files (`wasteland_hd/temporal_stage.py`, `tests/test_temporal_stage.py`,
+  `wasteland_hd/__main__.py`, `.gitignore`) and the new `docs/GATE-LIVE-CHECK.md`.
