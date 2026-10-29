@@ -493,3 +493,17 @@ def test_junction_lock_leaves_a_clean_frame_untouched(tmp_path):
     assert list(locked.getdata())[:38 * 40] == list(hd.getdata())[:38 * 40]
     assert list(locked.getdata())[38 * 40:] == list(original.resize((40, 40),
     Image.Resampling.NEAREST).getdata())[38 * 40:]
+
+
+def test_batch_pending_grows_after_gate_change_uses_new_generation(fixture, monkeypatch):
+    root, out, job, original, bad = _batch_fixture(fixture, monkeypatch)
+    base = out/'jobs'/job.name/'attempts'/'batch'
+    old = base/'denoise-0'/'sheets.json'
+    old.parent.mkdir(parents=True)
+    old.write_text(json.dumps({'keys': ['art/tiles/toy/1']}))
+    calls = []
+    _mock_comfy(monkeypatch, calls)
+    repair.Controller(root, out).run()
+    assert read_json(old) == {'keys': ['art/tiles/toy/1']}
+    new = read_json(base/'denoise-0-g2'/'sheets.json')
+    assert 'art/tiles/toy/2' in new['keys']

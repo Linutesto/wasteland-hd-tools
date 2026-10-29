@@ -322,17 +322,24 @@ class Controller:
         The snapshot is durable: a restart can omit already accepted directions
         without changing any sheet's contents or index.
         """
-        attempt = self.out/'jobs'/job/'attempts'/'batch'/f'denoise-{step}'
-        marker = attempt/'sheets.json'
-        saved = read_json(marker)
-        if saved is None:
-            keys = list(pending)
-            attempt.mkdir(parents=True, exist_ok=True)
-            atomic_json(marker, {'keys': keys})
-        else:
-            keys = saved['keys']
-            if not set(pending).issubset(keys):
-                raise ValueError(f'repair batch changed after checkpoint: {marker}')
+        # A gate change can add pending directions after a snapshot was taken.
+        # Never rewrite an old snapshot: use the first generation that covers
+        # the pending set, or start a new one (denoise-N-g2, -g3, ...).
+        generation = 1
+        while True:
+            name = f'denoise-{step}' if generation == 1 else f'denoise-{step}-g{generation}'
+            attempt = self.out/'jobs'/job/'attempts'/'batch'/name
+            marker = attempt/'sheets.json'
+            saved = read_json(marker)
+            if saved is None:
+                keys = list(pending)
+                attempt.mkdir(parents=True, exist_ok=True)
+                atomic_json(marker, {'keys': keys})
+                break
+            if set(pending).issubset(saved['keys']):
+                keys = saved['keys']
+                break
+            generation += 1
         from .gamefiles import read_frm
         frames = {False: [], True: []}
         decoded = {}
