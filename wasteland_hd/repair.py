@@ -141,7 +141,8 @@ class Controller:
                     result['issues'][rel] = 'QA colour/structure rejected'
                 score = invention.score(image, original,
                                          seam_delta=self.seam_for(rel, image, overrides),
-                                         floor=rel.startswith('art/tiles/'))
+                                         floor=rel.startswith('art/tiles/'),
+                                         kind=invention.kind_of(rel))
                 score['qa_badness'] = round(float(bad), 5)
                 result['frames'][rel] = score
                 if score['verdict'] in ('invented_texture','unmatched_floor'):
@@ -390,6 +391,18 @@ class Controller:
             last = self.gate(work, group, fallback)
             if last['complete']:
                 source, method = fallback, {'kind':'source_floor_2x'}
+        elif source is None:
+            # Non-floor art cannot borrow floor pixels; production falls back to
+            # the untouched game art for the whole direction, so do the same.
+            images = []
+            for f in group['frames']:
+                image = self.original(f['rel'])
+                images.append(image.resize((image.width*2, image.height*2),
+                                           Image.Resampling.NEAREST))
+            fallback = self._save_images(job, group, images, 'original-art')
+            last = self.gate(work, group, fallback)
+            if last['complete']:
+                source, method = fallback, {'kind':'original_game_art'}
         accepted = source is not None and last['complete']
         if accepted:
             for f in group['frames']:
@@ -399,7 +412,7 @@ class Controller:
                 self.hd_index[f['rel']] = self.out/'jobs'/job/'hd'/f['rel']
         result = {'source':str(source) if source else None, 'gate':last,
                   'hashes': {f['rel']:file_digest(self.out/'jobs'/job/'hd'/f['rel']) for f in group['frames']} if accepted else {},
-                  'fallback':method['kind'] if method and method['kind'] in ('edge_lock','source_floor_2x') else None,
+                  'fallback':method['kind'] if method and method['kind'] in ('edge_lock','source_floor_2x','original_game_art') else None,
                   'provenance':method, 'accepted':accepted}
         state['groups'][key] = result
         atomic_json(state_path, state)

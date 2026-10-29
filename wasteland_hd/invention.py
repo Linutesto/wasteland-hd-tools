@@ -24,25 +24,63 @@ TEXTURE_CLUSTER_LIMIT = 0.055
 FLAT_DAMAGE_LIMIT = 0.045
 MINOR_AREA_LIMIT = 0.04
 
+# Non-floor sprite calibration (walls/scenery/items/misc, October 29 2026
+# world-seam review). Sprites are alpha silhouettes, often thin strips or tiny
+# frames, so floor ratios alone misread them.
+KINDS = ('tiles', 'walls', 'scenery', 'items', 'misc')
+SPRITE_BAND = 4          # 2x px beside the alpha boundary: silhouette AA, not invention
+SPRITE_CORE_SHARE = 0.25 # band is only trusted when this much of the mask stays beyond it
+SPRITE_CORE_MIN = 64     # ...and at least this many 2x px do
+SPRITE_MIN_AREA = 400    # 2x opaque-px below which fractions need absolute evidence
+SPRITE_MIN_PIXELS = 12   # absolute novel px for minor_invention on tiny/thin sprites
+SPRITE_MIN_PIXELS_TEXTURE = 40   # absolute novel/flat px for invented_texture there
+SPRITE_DARK_LIMIT = 0.05 # dark-region novelty; sprites use a looser bar than tiles
+SPRITE_FLAT_CLUSTER = 0.03   # connected novelty needed before flat damage counts on sprites
+EMISSIVE_LIFT = 25.0     # HD brighter than source by this much is added light, not dark structure
+
+
+def kind_of(rel: str) -> str:
+    """Art kind for a relative art path; anything non-sprite counts as tiles."""
+    parts = rel.split('/')
+    if len(parts) >= 3 and parts[0] == 'art' and parts[1] in KINDS:
+        return parts[1]
+    return 'tiles'
+
 
 def _edge(rgb):
     grey = gaussian_filter(rgb.mean(axis=2), 1.2)
     return np.hypot(sobel(grey, axis=0), sobel(grey, axis=1))
 
 
-def _single_scale(hd, original):
+def _single_scale(hd, original, *, sprite=False):
     # Original is resized with bicubic interpolation, avoiding nearest-pixel edges.
     src = np.asarray(original.convert('RGBA').resize(hd.size, Image.Resampling.BICUBIC), np.float32)
     dst = np.asarray(hd.convert('RGBA'), np.float32)
     opaque = np.asarray(original.getchannel('A').resize(hd.size, Image.Resampling.NEAREST)) > 0
-    interior = distance_transform_edt(opaque) > 3
+    distance = distance_transform_edt(opaque)
+    interior = distance > 3
     mask = interior if interior.sum() >= 16 else opaque
+    keys = ('novel_fraction', 'largest_novel_region', 'novel_window', 'flat_damage',
+            'dark_novel', 'border_error')
     if not mask.any():
-        return {k: 0.0 for k in ('novel_fraction', 'largest_novel_region', 'novel_window', 'flat_damage', 'dark_novel', 'border_error')}
+        extra = ('novel_pixels', 'flat_pixels', 'mask_pixels') if sprite else ()
+        return {k: 0.0 for k in keys + extra}
     # Luminance finds absent edges; chroma catches the magenta stripes.
     se = maximum_filter(_edge(src[..., :3]), size=EDGE_DILATION)
     he = _edge(dst[..., :3])
     novel = (he > EDGE_ORIGINAL_FACTOR * se + EDGE_EXCESS) & mask
+    # Silhouette anti-aliasing is not invention: ignore the band hugging the
+    # alpha boundary, but only when enough of the sprite lies beyond it. Stroke
+    # art (fences, grids, blades) has no core at all, and a band that swallows
+    # the whole silhouette would blind the gate to wholly invented textures.
+    if sprite:
+        band = mask & (distance <= SPRITE_BAND)
+        core = mask & ~band
+        trusted = core.sum() >= SPRITE_CORE_MIN and core.sum() >= SPRITE_CORE_SHARE * mask.sum()
+        band = band if trusted else np.zeros_like(mask)
+    else:
+        band = np.zeros_like(mask)
+    novel = novel & ~band
     nearby = uniform_filter(novel.astype(np.float32), size=12)
     # Link edges in a motif before measuring connected area, then restrict to
     # truly novel edge pixels so thin, separate strokes do not become a full tile.
@@ -54,25 +92,65 @@ def _single_scale(hd, original):
         return np.sqrt(np.maximum(uniform_filter(a*a, size=9) - uniform_filter(a, size=9)**2, 0))
     flat = (std(source_luma) < FLAT_SOURCE_STD) & mask
     damage = flat & (std(hd_luma) > std(source_luma) + FLAT_EXCESS_STD)
-    boundary = opaque & (distance_transform_edt(opaque) <= 4)
+    if sprite:
+        damage = damage & ~band
+    dark = novel & (source_luma < 55)
+    if sprite:
+        # Lamps, screens and other lit detail may glow more after upscaling;
+        # added light is not invented dark structure. The lift is taken over a
+        # neighbourhood so the anti-aliased ring of a glow counts as light too.
+        lift = maximum_filter(hd_luma - source_luma, size=EDGE_DILATION)
+        dark = dark & ~(lift > EMISSIVE_LIFT)
+    boundary = opaque & (distance <= 4)
     # Include image perimeter; a fully opaque rectangle has no alpha boundary.
     boundary[:4] |= opaque[:4]; boundary[-4:] |= opaque[-4:]
     boundary[:, :4] |= opaque[:, :4]; boundary[:, -4:] |= opaque[:, -4:]
     err = np.abs(src[..., :3] - dst[..., :3]).mean(axis=2)
-    return {'novel_fraction': round(float(novel.sum()/mask.sum()), 5),
-            'largest_novel_region': round(float(largest/mask.sum()), 5),
-            'novel_window': round(float(nearby.max()), 5),
-            'flat_damage': round(float(damage.sum()/mask.sum()), 5),
-            'dark_novel': round(float((novel & (source_luma < 55)).sum()/mask.sum()), 5),
-            'border_error': round(float(err[boundary].mean()) if boundary.any() else 0.0, 3)}
+    result = {'novel_fraction': round(float(novel.sum()/mask.sum()), 5),
+              'largest_novel_region': round(float(largest/mask.sum()), 5),
+              'novel_window': round(float(nearby.max()), 5),
+              'flat_damage': round(float(damage.sum()/mask.sum()), 5),
+              'dark_novel': round(float(dark.sum()/mask.sum()), 5),
+              'border_error': round(float(err[boundary].mean()) if boundary.any() else 0.0, 3)}
+    if sprite:
+        result.update({'novel_pixels': int(novel.sum()), 'flat_pixels': int(damage.sum()),
+                       'mask_pixels': int(mask.sum())})
+    return result
 
 
-def score(hd: Image.Image, original: Image.Image, *, seam_delta=0.0, floor=True):
+def _sprite_verdict(high):
+    """Verdict for alpha sprites, using absolute evidence on tiny/thin frames."""
+    area = high['novel_fraction']; cluster = high['largest_novel_region']
+    flat = high['flat_damage']; dark = high['dark_novel']
+    if high['mask_pixels'] < SPRITE_MIN_AREA:
+        # A handful of novel pixels moves a ratio a lot on tiny frames; demand
+        # a real amount of changed structure before failing one. Flat-area
+        # damage says nothing here: a bicubic-resized thin stroke reads as
+        # flat source, so faithful wires would look damaged everywhere.
+        if high['novel_pixels'] >= SPRITE_MIN_PIXELS_TEXTURE:
+            return 'invented_texture'
+        if high['novel_pixels'] >= SPRITE_MIN_PIXELS:
+            return 'minor_invention'
+        return 'clean'
+    if area > TEXTURE_AREA_LIMIT or cluster > TEXTURE_CLUSTER_LIMIT or (flat > FLAT_DAMAGE_LIMIT and cluster > SPRITE_FLAT_CLUSTER) or dark > SPRITE_DARK_LIMIT:
+        return 'invented_texture'
+    if area > MINOR_AREA_LIMIT or cluster > 0.015:
+        return 'minor_invention'
+    return 'clean'
+
+
+def score(hd: Image.Image, original: Image.Image, *, seam_delta=0.0, floor=True, kind='tiles'):
     """Return measurements at native and 2x sizes and a four-way verdict."""
+    if kind not in KINDS:
+        raise ValueError(f'unknown art kind: {kind!r}')
     if hd.size != (original.width*2, original.height*2):
         raise ValueError('HD frame must be exact 2x')
-    native = _single_scale(hd.resize(original.size, Image.Resampling.BOX), original)
-    high = _single_scale(hd, original)
+    sprite = kind != 'tiles'
+    # Sprite border error is measured at the alpha silhouette, where AA and
+    # erosion are normal; only floor tiles can be unmatched against neighbours.
+    floor = floor and not sprite
+    native = _single_scale(hd.resize(original.size, Image.Resampling.BOX), original, sprite=sprite)
+    high = _single_scale(hd, original, sprite=sprite)
     # At native scale, source pixels are themselves strongly stair-stepped;
     # use the 2x evidence for inventions and retain native evidence for review.
     area = high['novel_fraction']; cluster = high['largest_novel_region']
@@ -80,6 +158,8 @@ def score(hd: Image.Image, original: Image.Image, *, seam_delta=0.0, floor=True)
     border = high['border_error']
     if floor and (border > BORDER_ERROR_LIMIT or seam_delta > SEAM_DELTA_LIMIT):
         verdict = 'unmatched_floor'
+    elif sprite:
+        verdict = _sprite_verdict(high)
     elif area > TEXTURE_AREA_LIMIT or cluster > TEXTURE_CLUSTER_LIMIT or (flat > FLAT_DAMAGE_LIMIT and cluster > 0.025) or high['dark_novel'] > 0.025:
         verdict = 'invented_texture'
     elif area > MINOR_AREA_LIMIT or cluster > 0.015:
@@ -87,7 +167,7 @@ def score(hd: Image.Image, original: Image.Image, *, seam_delta=0.0, floor=True)
     else:
         verdict = 'clean'
     return {'verdict': verdict, 'native': native, 'scale2': high,
-            'seam_delta': round(float(seam_delta), 3)}
+            'seam_delta': round(float(seam_delta), 3), 'kind': kind}
 
 
 def map_adjacency(game):

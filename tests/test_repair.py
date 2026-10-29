@@ -331,3 +331,29 @@ def test_batch_multiple_sheets_resume_after_later_sheet(fixture, monkeypatch):
     assert calls == ['static-00000.png', 'static-00001.png', 'static-00002.png']
     assert all(not isinstance(item, RuntimeError) for item in result.values())
     assert len(list((out/'jobs'/job.name/'attempts'/'batch'/'denoise-0').glob('*-render.png'))) == 3
+
+
+def test_sprite_direction_gates_by_kind_and_falls_back_to_original_art(tmp_path, monkeypatch):
+    root, out = tmp_path/'production', tmp_path/'repair'
+    root.mkdir()
+    (root/'plan.json').write_text(json.dumps({'game':'fixture'}))
+    original = Image.new('RGBA',(16,20),(110,100,90,255))
+    good = original.resize((32,40),Image.Resampling.NEAREST)
+    rel = 'art/scenery/toy/0_0.png'
+    expected = {'rel':rel,'width':32,'height':40,'alpha':digest(good.getchannel('A').tobytes())}
+    group = {'art':'art/scenery/toy.frm','direction':0,'frames':[expected],'animated':False}
+    monkeypatch.setattr(repair,'Game',lambda game: SimpleNamespace())
+    monkeypatch.setattr(repair.qa,'original_frame',lambda game,cache,r: original)
+    monkeypatch.setattr(repair.invention,'cached_adjacency',lambda *a,**kw: [])
+    controller = repair.Controller(root,out)
+    controller.seams = {}
+    def no_render(*args,**kwargs):
+        raise RuntimeError('no comfyui in tests')
+    monkeypatch.setattr(repair.Controller,'render',no_render)
+    work = tmp_path/'scenery-0000'
+    result = controller.process_group(work,'art/scenery/toy/0',group,False)
+    assert result['gate']['frames'][rel]['kind'] == 'scenery'
+    assert result['accepted'] is True
+    assert result['fallback'] == 'original_game_art'
+    with Image.open(out/'jobs'/'scenery-0000'/'hd'/rel) as saved:
+        assert list(saved.getdata()) == list(good.getdata())
