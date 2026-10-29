@@ -6,6 +6,7 @@
   python -m wasteland_hd cut     --work WORK
   python -m wasteland_hd seams   --game DIR --source WORK/hd --out FIXED/hd
   python -m wasteland_hd stabilise --game DIR --source WORK/hd --out FIXED/hd
+  python -m wasteland_hd temporal --game DIR --source WORK/hd --out FIXED/hd  (keyframe identity transfer)
   python -m wasteland_hd flicker --game DIR --source WORK/hd --json FLICKER.json  (measure animation boiling)
   python -m wasteland_hd qa      --game DIR --work WORK [--also RETRY]  (drop recoloured frames)
   python -m wasteland_hd retry   --game DIR --work WORK   (sheets of rejected frames, in WORK/retry)
@@ -137,6 +138,42 @@ def cmd_stabilise(args):
     for group, values in scores.items():
         print(f"{group}: {values['before']:.3f} -> {values['after']:.3f} flicker")
     print(f"{len(scores)} critter directions stabilised in {args.out}")
+
+
+def cmd_temporal(args):
+    """Keyframe-anchored identity transfer; keeps only directions whose gate margin improves."""
+    from . import temporal_stage
+
+    result = temporal_stage.stage_directory(
+        Game(args.game), args.source, args.out, names=args.anim,
+        components=tuple(args.components.split(",")), strength=args.strength,
+        radius=args.radius, select=not args.keep_all,
+        fallback=not args.no_fallback, cap=args.fallback_cap)
+    directions = result["directions"]
+    for group, values in sorted(directions.items()):
+        before, after = values["before"], values["after"]
+        state = "fallback" if values["fallback"] else ("kept" if values["accepted"] else "reverted")
+        print(f"{group}: keyframe {values['keyframe']} {state}  "
+              f"flicker {before['flicker']} -> {after['flicker']}  "
+              f"broad {before['broad']} -> {after['broad']}  "
+              f"material {before['material']} -> {after['material']}  "
+              f"margin {temporal_stage.margin(before):.2f} -> {temporal_stage.margin(after):.2f}")
+    for name, values in sorted(result["animations"].items()):
+        print(f"{name}: flicker {values['flicker']:.3f} broad {values['broad']:.3f} "
+              f"material {values['material']:.3f} -> "
+              f"{'pass' if temporal_stage.passes(values) else 'FAIL'} "
+              f"({values['fallbacks']}/{values['directions']} directions on original art)")
+    fallbacks = sum(v["fallback"] for v in directions.values())
+    kept = sum(v["accepted"] and not v["fallback"] for v in directions.values())
+    print(f"{kept}/{len(directions)} directions rewritten, {fallbacks} fell back to original art, "
+          f"{len(directions) - kept - fallbacks} reverted, in {args.out}")
+    if args.json:
+        from pathlib import Path
+        from .flicker import safe_output, write_json
+
+        safe_output(args.source, args.json)
+        write_json(result, Path(args.json))
+        print(f"JSON: {args.json}")
 
 
 def cmd_flicker(args):
@@ -370,6 +407,22 @@ def main():
     p.add_argument("--source", required=True, help="HD folder containing art/critters/")
     p.add_argument("--out", required=True, help="empty separate destination HD folder")
     p.add_argument("--radius", type=int, default=9, help="native pixels for original-only patch matching")
+    p = sub.add_parser("temporal", help="keyframe-anchored identity transfer for critter animations (CPU)")
+    p.add_argument("--game", required=True, help="your own Fallout 2 game folder")
+    p.add_argument("--source", required=True, help="HD folder containing art/critters/")
+    p.add_argument("--out", required=True, help="empty separate destination HD folder")
+    p.add_argument("--anim", action="append", help="only this animation (default: every one in --source)")
+    p.add_argument("--components", default="colour,residual,texture,static",
+                   help="comma list of colour,residual,texture,static (default: all four)")
+    p.add_argument("--strength", type=float, default=1.0, help="scale every transfer (0..1)")
+    p.add_argument("--radius", type=int, default=9, help="native pixels for original-only patch matching")
+    p.add_argument("--keep-all", action="store_true",
+                   help="write every direction, even when its gate margin gets worse")
+    p.add_argument("--no-fallback", action="store_true",
+                   help="keep a staged direction even when it stays over the direction cap")
+    p.add_argument("--fallback-cap", type=float, default=2.0,
+                   help="direction flicker above this x its animation mean becomes original art")
+    p.add_argument("--json", help="per-direction before/after report (never inside --source)")
     for name in ("qa", "retry"):
         p = sub.add_parser(name, help="drop frames the model recoloured; --also adds another run's frames as candidates"
                            if name == "qa" else "sheets of the frames qa rejected, for another upscale run")
