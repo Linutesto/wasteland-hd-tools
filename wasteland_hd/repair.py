@@ -26,6 +26,9 @@ REPAIR_SEEDS = (1009, 1013)
 # run only re-measures junctions whose art actually changed.
 WALL_SEAM_CACHE_MAX = 400_000
 WALL_SEAM_CACHE = 'wall-seam-cache.json'
+# Bright 1-px rim: how much further an outer opaque pixel must step away from
+# its inward neighbour than the source art does before it is pulled back.
+EDGE_RESTORE_TOLERANCE = 4.0
 
 
 class RepairModel(Comfy):
@@ -82,6 +85,64 @@ def junction_lock(hd, source, band, width=10):
     rgb = np.clip(np.rint(b[..., :3] * (1 - weight[..., None]) + a[..., :3] * weight[..., None]),
                   0, 255).astype('uint8')
     return Image.fromarray(np.dstack((rgb, a[..., 3].astype('uint8'))))
+
+
+def edge_restore(hd, original, tolerance=EDGE_RESTORE_TOLERANCE):
+    """Pull a frame's outermost opaque pixels back to the source edge colour.
+
+    A redraw leaves a bright 1-px rim on the alpha boundary: the outermost
+    opaque pixel sits brighter than its inward neighbour by more than the
+    source art's own edge does there, so wherever that edge lies over a
+    neighbour it reads as a light vertical line the 1999 art does not have
+    (the junction colour band dilutes such a thin feature; readers see it on
+    every piece edge).
+
+    Only pixels that step up like that are replaced, one layer deep on each of
+    the four sides: a frame whose edge already agrees with the source, or one
+    that steps *down* at the silhouette as the source's own outline does, is
+    returned unchanged, and no interior texture is touched.  Alpha is
+    untouched: it is already the original's.
+    """
+    import numpy as np
+    a = np.asarray(hd.convert('RGBA'), np.float32)
+    b = np.asarray(original.convert('RGBA').resize(hd.size, Image.Resampling.NEAREST),
+                   np.float32)
+    if a.shape != b.shape:
+        raise ValueError('edge restore needs matching sizes')
+    mask = a[..., 3] > 0
+    if not mask.any():
+        return hd.copy()
+    light = a[..., :3].mean(axis=2)
+    source = b[..., :3].mean(axis=2)
+    rgb = a[..., :3].copy()
+    height, width = mask.shape
+
+    def rim(r, c, inside):
+        """True where the HD edge steps up further than the source's edge does."""
+        step = light[r, c] - light[inside]
+        source_step = max(0.0, float(source[r, c] - source[inside]))
+        return step > source_step + tolerance
+
+    for r in range(height):
+        opaque = np.flatnonzero(mask[r])
+        if len(opaque) < 2:
+            continue
+        lo, hi = int(opaque[0]), int(opaque[-1])
+        for at, inside in ((lo, lo + 1), (hi, hi - 1)):
+            if rim(r, at, (r, inside)):
+                rgb[r, at] = b[r, at, :3]
+    for c in range(width):
+        opaque = np.flatnonzero(mask[:, c])
+        if len(opaque) < 2:
+            continue
+        lo, hi = int(opaque[0]), int(opaque[-1])
+        for at, inside in ((lo, lo + 1), (hi, hi - 1)):
+            if rim(at, c, (inside, c)):
+                rgb[at, c] = b[at, c, :3]
+
+    out = np.dstack([np.clip(np.rint(rgb), 0, 255).astype('uint8'),
+                     a[..., 3].astype('uint8')])
+    return Image.fromarray(out)
 
 
 class Controller:
@@ -165,7 +226,7 @@ class Controller:
         """Wall junction delta, memoised on both frames' content digests."""
         if self.wall_delta_cache is None:
             self.wall_delta_cache = {}
-        key = f'{rel_a}|{digest_a}|{rel_b}|{digest_b}|{placement["dx"]},{placement["dy"]}'
+        key = f'v{invention.WALL_SEAM_METRIC}|{rel_a}|{digest_a}|{rel_b}|{digest_b}|{placement["dx"]},{placement["dy"]}'
         hit = self.wall_delta_cache.get(key)
         if hit is not None:
             return hit
@@ -677,11 +738,15 @@ class Controller:
         return resolved
 
     def _repair_wall_group(self, rel, groups, results):
-        """Move one wall direction forward: junction lock once, then original art.
+        """Move one wall direction forward: edge restore, junction lock, original art.
 
-        Returns True when the group's shipped frame changed. The steps only
-        ever move the frame closer to the source art, so repeated rounds
-        converge instead of oscillating.
+        The steps only ever move the frame closer to the source art, so
+        repeated rounds converge instead of oscillating: a bright 1-px rim on
+        the frame's own edge is corrected first (one pixel layer, alpha
+        untouched), then the junction band is pulled back to the source, then
+        the whole direction falls back to the untouched game art.
+
+        Returns True when the group's shipped frame changed.
         """
         work, key, group = groups[rel]
         job = work.name
@@ -694,21 +759,35 @@ class Controller:
         if source is None:
             return False
         candidate = Path(source)
-        images = None
-        provenance = None
-        name = None
+
+        def images_for(kind):
+            built = []
+            for f in group['frames']:
+                with Image.open(candidate/f['rel']) as hd:
+                    if kind == 'edge-restore':
+                        built.append(edge_restore(hd, self.original(f['rel'])))
+                    else:
+                        built.append(junction_lock(hd, self.original(f['rel']),
+                                                   self.wall_band(f['rel'])))
+            return built
+
+        attempts = []
+        if candidate.name not in ('edge-restore', 'junction-lock'):
+            attempts.append(('edge-restore', 'edge_restore'))
         if candidate.name != 'junction-lock':
             # Already locked once: locking again from the locked result is the
             # same image, so go straight to the fallback below.
-            images = []
-            for f in group['frames']:
-                with Image.open(candidate/f['rel']) as hd:
-                    images.append(junction_lock(hd, self.original(f['rel']), self.wall_band(f['rel'])))
-            provenance = {'kind':'junction_lock', 'source':str(candidate)}
-            name = 'junction-lock'
-        fixed = self._save_images(job, group, images, name) if images is not None else None
-        measured = self.gate(work, group, fixed) if fixed is not None else {'complete': False}
-        if not measured.get('complete'):
+            attempts.append(('junction-lock', 'junction_lock'))
+        fixed = measured = provenance = None
+        for name, kind in attempts:
+            candidate_images = images_for(name)
+            trial = self._save_images(job, group, candidate_images, name)
+            trial_gate = self.gate(work, group, trial)
+            if trial_gate.get('complete'):
+                fixed, measured = trial, trial_gate
+                provenance = {'kind': kind, 'source': str(candidate)}
+                break
+        if not measured:
             # Untouched game art matches every neighbour's source art by
             # construction, which is the only junction that cannot rematch.
             images = [self.original(f['rel']).resize((self.original(f['rel']).width*2,
@@ -717,7 +796,7 @@ class Controller:
                       for f in group['frames']]
             fixed = self._save_images(job, group, images, 'original-art')
             measured = self.gate(work, group, fixed)
-            provenance = {'kind':'original_game_art'}
+            provenance = {'kind': 'original_game_art'}
         if not measured.get('complete'):
             return False
         for f in group['frames']:
@@ -729,7 +808,7 @@ class Controller:
             'source': str(fixed), 'gate': measured, 'accepted': True,
             'hashes': {f['rel']: file_digest(self.out/'jobs'/job/'hd'/f['rel'])
                        for f in group['frames']},
-            'fallback': provenance['kind'] if provenance['kind'] in ('junction_lock', 'original_game_art')
+            'fallback': provenance['kind'] if provenance['kind'] in ('edge_restore', 'junction_lock', 'original_game_art')
                         else entry.get('fallback'),
             'provenance': provenance,
         })
@@ -740,6 +819,42 @@ class Controller:
         atomic_json(state_path, state)
         return True
 
+    def refresh_wall_gates(self, jobs, results):
+        """Re-gate wall directions whose stored verdict predates their neighbours.
+
+        A direction that took the pending junction-lock branch keeps the gate it
+        measured before the other side of that junction was corrected, so the
+        final report counts an `unmatched_wall` that the frames actually
+        shipping no longer have.  Measuring those frames again makes the report
+        describe the art; only --out is written.
+        """
+        for work, _state, manifest in jobs:
+            for key, group in manifest['groups'].items():
+                if not group['art'].startswith('art/walls/'):
+                    continue
+                entry = results.get((work.name, key))
+                if not entry or not entry.get('accepted'):
+                    continue
+                gate = entry.get('gate') or {}
+                if not gate.get('issues'):
+                    continue  # stored verdicts already describe the shipping art
+                source = entry.get('source')
+                if source in (None, 'production'):
+                    source = self.candidate_from_production(work, group)
+                if source is None:
+                    continue
+                measured = self.gate(work, group, Path(source))
+                if measured == gate:
+                    continue
+                entry['gate'] = measured
+                provenance = entry.get('provenance')
+                if not measured.get('issues') and isinstance(provenance, dict):
+                    provenance.pop('unmatched_neighbour', None)
+                state_path = self.out/'jobs'/work.name/'state.json'
+                state = read_json(state_path, {'groups': {}})
+                state['groups'][key] = entry
+                atomic_json(state_path, state)
+
     def reconcile_walls(self, jobs, results):
         """Re-check every wall junction with the frames that will actually ship.
 
@@ -748,7 +863,8 @@ class Controller:
         junction where one side fell back to original art is not the junction
         the ladder saw. Measured here once both sides hold their final frame;
         the side still carrying AI pixels is corrected, then (if that is not
-        enough) replaced by original art.
+        enough) replaced by original art.  Directions whose stored verdict was
+        measured before their neighbours were final are re-gated afterwards.
         """
         if not self.wall_junctions:
             return results
@@ -773,7 +889,7 @@ class Controller:
                 if delta > invention.WALL_SEAM_DELTA_LIMIT:
                     broken.append((a, b))
             if not broken:
-                return results
+                break
             changed = set()
             for a, b in broken:
                 for rel in (a, b):
@@ -786,7 +902,8 @@ class Controller:
                     if self._repair_wall_group(rel, groups, results):
                         changed.add(rel)
             if not changed:
-                return results
+                break
+        self.refresh_wall_gates(jobs, results)
         return results
 
     def _run_jobs(self,jobs):

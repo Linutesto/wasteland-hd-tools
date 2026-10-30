@@ -481,6 +481,54 @@ def test_reconciliation_checks_a_junction_the_ladder_never_saw(tmp_path, monkeyp
     assert delta <= invention.WALL_SEAM_DELTA_LIMIT
 
 
+def test_reconciliation_refreshes_a_verdict_taken_before_the_neighbour_changed(tmp_path, monkeypatch):
+    """The pending junction-lock branch keeps a gate measured before its
+    neighbour was final; reconciliation re-gates what actually ships."""
+    from wasteland_hd import repair as r
+    fx = _wall_fixture(tmp_path, monkeypatch)
+    # wb's production frame breaks the junction from its own side (same alpha).
+    dark = fx.good[fx.wb].copy()
+    pixels = dark.load()
+    for x in range(8):
+        for y in range(120):
+            red, green, blue, alpha = pixels[x, y]
+            if alpha:
+                pixels[x, y] = (max(0, red - 75), max(0, green - 75),
+                                min(255, blue + 40), alpha)
+    dark.save(fx.works['art/walls/wb/0'] / 'hd' / fx.wb)
+    def render_always_broken(self, job_name, key, group, step, denoise):
+        dest = fx.out / f'candidate-{job_name}-{step}'
+        rel = group['frames'][0]['rel']
+        path = dest / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        (fx.bad if rel == fx.wa else dark).save(path)
+        return dest, {'kind': 'reduced_denoise', 'denoise': denoise}
+    monkeypatch.setattr(r.Controller, 'render', render_always_broken)
+    controller = repair.Controller(fx.root, fx.out)
+    controller.seam_index()
+    # wb shipped earlier, so wa's ladder can see the junction it breaks.
+    controller.hd_index[fx.wb] = fx.works['art/walls/wb/0'] / 'hd' / fx.wb
+    key_a, key_b = 'art/walls/wa/0', 'art/walls/wb/0'
+    result_a = controller.process_group(fx.works[key_a], key_a, fx.groups[key_a], False)
+    # wa cannot clear: the neighbour still carries AI pixels, so it ships with
+    # a stored verdict that no longer describes the pair once wb is fixed.
+    assert result_a['accepted'] and result_a['provenance'].get('unmatched_neighbour')
+    assert set(result_a['gate']['issues'].values()) == {'unmatched_wall'}
+    result_b = controller.process_group(fx.works[key_b], key_b, fx.groups[key_b], False)
+    assert result_b['accepted'] and not result_b['gate']['issues']
+    jobs = [(fx.works[key_a], {'groups': {}}, {'groups': {key_a: fx.groups[key_a]}}),
+            (fx.works[key_b], {'groups': {}}, {'groups': {key_b: fx.groups[key_b]}})]
+    results = {(fx.works[key_a].name, key_a): result_a,
+               (fx.works[key_b].name, key_b): result_b}
+    controller.reconcile_walls(jobs, results)
+    updated = results[(fx.works[key_a].name, key_a)]
+    assert updated['gate']['issues'] == {}, 'the shipping frames are re-measured'
+    assert updated['gate']['frames'][fx.wa]['verdict'] != 'unmatched_wall'
+    assert 'unmatched_neighbour' not in (updated['provenance'] or {})
+    saved = read_json(fx.out / 'jobs' / 'walls-0000' / 'state.json')['groups'][key_a]
+    assert saved['gate']['issues'] == {}, 'the refreshed gate is durable'
+
+
 def test_junction_lock_leaves_a_clean_frame_untouched(tmp_path):
     original = Image.new('RGBA', (20, 20), (100, 90, 80, 255))
     hd = original.resize((40, 40), Image.Resampling.NEAREST)
@@ -507,3 +555,44 @@ def test_batch_pending_grows_after_gate_change_uses_new_generation(fixture, monk
     assert read_json(old) == {'keys': ['art/tiles/toy/1']}
     new = read_json(base/'denoise-0-g2'/'sheets.json')
     assert 'art/tiles/toy/2' in new['keys']
+
+
+def test_edge_restore_pulls_a_bright_rim_back_to_the_source():
+    """A redraw's 1-px bright rim on the alpha boundary: what reads as a light
+    vertical line wherever the frame's edge lies over a neighbour."""
+    original = Image.new('RGBA', (40, 30), (150, 130, 110, 255))
+    draw = ImageDraw.Draw(original)
+    for y in range(0, 30, 4):
+        draw.rectangle((0, y, 39, y), fill=(140, 120, 100, 255))
+    clean = original.resize((80, 60), Image.Resampling.NEAREST)
+    rim = clean.copy()
+    px = rim.load()
+    for y in range(60):
+        for x in (0, 79):
+            r, g, b, a = px[x, y]
+            px[x, y] = (min(255, r + 60), min(255, g + 60), min(255, b + 60), a)
+    fixed = repair.edge_restore(rim, original)
+    assert fixed.getchannel('A').tobytes() == rim.getchannel('A').tobytes(), 'alpha untouched'
+    for x in (0, 79):
+        assert [fixed.getpixel((x, y)) for y in range(60)] == \
+               [clean.getpixel((x, y)) for y in range(60)], 'the rim is the source edge again'
+    assert fixed.getpixel((40, 30)) == rim.getpixel((40, 30)), 'interior texture untouched'
+    # A frame already agreeing with the source is returned unchanged.
+    assert list(repair.edge_restore(clean, original).getdata()) == list(clean.getdata())
+
+
+def test_edge_restore_keeps_a_step_down_at_the_silhouette():
+    """The source's own dark outline stays the source's: a softened outline is
+    not a bright rim, so it is left as the redraw has it."""
+    original = Image.new('RGBA', (20, 20), (0, 0, 0, 0))
+    ImageDraw.Draw(original).rectangle((1, 1, 18, 18), fill=(150, 130, 110, 255),
+                                       outline=(40, 35, 30, 255))
+    hd = original.resize((40, 40), Image.Resampling.NEAREST)
+    softened = hd.copy()
+    px = softened.load()
+    for y in range(40):
+        for x in (2, 3, 36, 37):        # the whole outline band, still darker than inside
+            r, g, b, a = px[x, y]
+            if a:
+                px[x, y] = (r + 50, g + 50, b + 50, a)
+    assert list(repair.edge_restore(softened, original).getdata()) == list(softened.getdata())
