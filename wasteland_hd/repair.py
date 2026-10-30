@@ -14,6 +14,7 @@ import zipfile
 from PIL import Image
 
 from . import invention, qa, sheets
+from .chroma import cast_correct
 from .floor_fidelity import source_floor_2x
 from .gamefiles import Game
 from .production import (atomic_copy, atomic_json, controller_lock, file_digest,
@@ -766,6 +767,10 @@ class Controller:
                 with Image.open(candidate/f['rel']) as hd:
                     if kind == 'edge-restore':
                         built.append(edge_restore(hd, self.original(f['rel'])))
+                    elif kind == 'chroma-cast':
+                        # Pull a flagged cast region's chroma back to the source;
+                        # HD luminance/detail and alpha untouched.
+                        built.append(cast_correct(hd, self.original(f['rel'])))
                     else:
                         built.append(junction_lock(hd, self.original(f['rel']),
                                                    self.wall_band(f['rel'])))
@@ -778,6 +783,11 @@ class Controller:
             # Already locked once: locking again from the locked result is the
             # same image, so go straight to the fallback below.
             attempts.append(('junction-lock', 'junction_lock'))
+        if candidate.name != 'chroma-cast':
+            # Last CPU attempt before original art: chroma fidelity only, so it
+            # runs after the structural steps and never loops (it is a no-op
+            # when no region is flagged).
+            attempts.append(('chroma-cast', 'chroma_cast'))
         fixed = measured = provenance = None
         for name, kind in attempts:
             candidate_images = images_for(name)
@@ -808,7 +818,7 @@ class Controller:
             'source': str(fixed), 'gate': measured, 'accepted': True,
             'hashes': {f['rel']: file_digest(self.out/'jobs'/job/'hd'/f['rel'])
                        for f in group['frames']},
-            'fallback': provenance['kind'] if provenance['kind'] in ('edge_restore', 'junction_lock', 'original_game_art')
+            'fallback': provenance['kind'] if provenance['kind'] in ('edge_restore', 'junction_lock', 'chroma_cast', 'original_game_art')
                         else entry.get('fallback'),
             'provenance': provenance,
         })

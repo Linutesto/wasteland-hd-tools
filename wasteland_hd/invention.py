@@ -10,6 +10,7 @@ from PIL import Image
 from scipy.ndimage import (binary_dilation, distance_transform_edt, gaussian_filter,
                            label, maximum_filter, sobel, uniform_filter)
 
+from .chroma import cast_measure
 from .gamefiles import read_frm
 from .production import atomic_json, read_json
 
@@ -175,7 +176,8 @@ def source_exact(hd: Image.Image, original: Image.Image) -> bool:
                                      .resize(hd.size, Image.Resampling.NEAREST)))
 
 
-def score(hd: Image.Image, original: Image.Image, *, seam_delta=0.0, floor=True, kind='tiles'):
+def score(hd: Image.Image, original: Image.Image, *, seam_delta=0.0, floor=True, kind='tiles',
+          cast_tiles=False):
     """Return measurements at native and 2x sizes and a four-way verdict."""
     if kind not in KINDS:
         raise ValueError(f'unknown art kind: {kind!r}')
@@ -211,8 +213,18 @@ def score(hd: Image.Image, original: Image.Image, *, seam_delta=0.0, floor=True,
         verdict = 'minor_invention'
     else:
         verdict = 'clean'
-    return {'verdict': verdict, 'native': native, 'scale2': high,
-            'seam_delta': round(float(seam_delta), 3), 'kind': kind}
+    score_out = {'verdict': verdict, 'native': native, 'scale2': high,
+                 'seam_delta': round(float(seam_delta), 3), 'kind': kind}
+    # A chroma cast (a connected region whose a*/b* moved consistently) is a
+    # fidelity detail, not a calibrated hard fail: the regional-mean gates
+    # cannot see one, so it is reported here without touching the verdict.
+    # Tiles/floors are not measured by default — their verdicts, keys and
+    # outputs stay byte-identical — although the label evidence does show
+    # placeholder-tile casts (bld20xx "Unused Tile"), so `cast_tiles=True`
+    # includes them (see docs/CHROMA-REPORT.md).
+    if kind != 'tiles' or cast_tiles:
+        score_out['cast'] = cast_measure(hd, original)
+    return score_out
 
 
 def map_adjacency(game):
