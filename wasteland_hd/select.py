@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import urllib.request
+import zipfile
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -19,14 +20,67 @@ from .gamefiles import Game
 from .production import integrity
 
 BAD = {'invented_texture', 'unmatched_floor', 'unmatched_wall'}
+# The two names fallback() gives original art; a pack source in here is not HD.
+FALLBACK = frozenset({'original_game_art', 'source_floor_2x'})
+CRITTER_ART = 'art/critters/'
+# A classic ZIP addresses 65535 entries; the Android updater refuses ZIP64.
+MAX_ZIP_ENTRIES = 0xFFFF
 MODEL = 'nvidia/nemotron-3.5-super-vl-120b-a12b'
 FALLBACK_MODEL = 'meta/llama-3.2-90b-vision-instruct'
 
 
-def source_roots(prod, repair, job):
+def stage_root(attempt):
+    """The post-process (temporal stage) tree an attempt finished in, or None.
+
+    Production copies a critter direction into ``hd`` from the tree the post-process
+    checkpoint names; the raw ``attempt/hd`` is the pre-temporal render.  Critter
+    candidates are gate inputs only from the stage output, so an attempt without a
+    usable checkpoint is not a root at all.
+    """
+    record = attempt/'post.json'
+    if not record.is_file():
+        return None
+    try:
+        target = Path(json.loads(record.read_text()).get('hd') or '')
+    except (OSError, ValueError, TypeError):
+        return None
+    return target if target.is_dir() and target.is_relative_to(attempt) else None
+
+
+def flicker_verdict(state, key):
+    """Flicker-gate verdict of one direction recorded in production ``state.json``.
+
+    ``accept()`` stores it on the group (``flicker``); a finished job also carries the
+    temporal stage's per-direction table under ``temporal.directions``.  None means
+    no verdict was recorded for the direction (the temporal stage never judged it).
+    """
+    group = (state.get('groups') or {}).get(key) or {}
+    verdict = group.get('flicker')
+    if not isinstance(verdict, dict) or 'pass' not in verdict:
+        verdict = ((state.get('temporal') or {}).get('directions') or {}).get(key)
+    return verdict if isinstance(verdict, dict) and 'pass' in verdict else None
+
+
+def production_refuser(verdict):
+    """Gate input: a failed flicker verdict refuses every production root of the direction.
+
+    The verdict describes production's staged frames, so repair candidates (re-renders
+    gated by integrity/QA/invention) stay eligible; when they pass they win, and only
+    when nothing passes does the direction fall back to original art.
+    """
+    if not verdict or verdict.get('pass'):
+        return None
+    return lambda name, root: 'flicker_gate' if name.startswith('production') else None
+
+
+def source_roots(prod, repair, job, critter=False):
     p, r = prod/'jobs'/job, repair/'jobs'/job
     roots = [('production', p/'hd')]
-    roots += [(f'production_{x.name}', x/'hd') for x in sorted(p.glob('attempt-*'))]
+    if critter:
+        roots += [(f'production_{x.name}', staged) for x in sorted(p.glob('attempt-*'))
+                  if (staged := stage_root(x)) is not None]
+    else:
+        roots += [(f'production_{x.name}', x/'hd') for x in sorted(p.glob('attempt-*'))]
     roots += [(f'repair_{x.relative_to(r).as_posix()}', x) for x in sorted((r/'attempts').glob('**/candidate/hd'))]
     roots += [('repair_accepted', r/'hd')]
     roots += [(f'repair_{x.name}', x) for x in (r/'edge-lock', r/'junction-lock', r/'edge-restore') if x.exists()]
@@ -59,10 +113,43 @@ def score(f, weights):
     return weights[0]*f['detail'] - weights[1]*f['novelty'] - weights[2]*f['drift']
 
 
-def candidates(group, roots, originals, wall_pairs=None, tile_pairs=None, reference=None):
+def rank(found, weights):
+    """Score the gate-passing candidates; original art never joins the ranking."""
+    passing, fallback = [], None
+    for item in found:
+        if item['frames']:
+            item['score'] = round(sum(score(f['features'], weights)
+                                      for f in item['frames'].values()) / max(1, len(item['frames'])), 6)
+            passing.append(item)
+        else:
+            item['score'] = 0.0
+            fallback = item
+    passing.sort(key=lambda x: x['score'], reverse=True)
+    return passing, fallback
+
+
+def choose(found, weights):
+    """Gate first: original art only when NO candidate passed; the score ranks passing HD art.
+
+    Returns ``(chosen, reason, candidates)`` with candidates ordered best-passing first
+    and the original-art fallback last, which is the order ``selection.json`` records and
+    ``tools/hd-pack-build.py`` reads (it skips fallback entries and takes the first other).
+    """
+    passing, fallback = rank(found, weights)
+    ordered = passing + ([fallback] if fallback else [])
+    if passing:
+        return passing[0], 'gate then fitted detail score', ordered
+    return fallback, 'no candidate passed the gate', ordered
+
+
+def candidates(group, roots, originals, wall_pairs=None, tile_pairs=None, reference=None, refuse=None):
     found = []; seen = set()
     for name, root in roots:
-        if not all((root/f['rel']).is_file() for f in group['frames']):
+        # A direction is one candidate: every frame must live in this single root
+        # (never a mix of roots), and a refused root contributes none of its frames.
+        if root is None or not all((root/f['rel']).is_file() for f in group['frames']):
+            continue
+        if refuse and refuse(name, root):
             continue
         fingerprint = tuple(hashlib.sha256((root/f['rel']).read_bytes()).hexdigest() for f in group['frames'])
         if fingerprint in seen: continue
@@ -220,6 +307,101 @@ def contact_sheets(out, spot, originals, limit=20):
         sheet.save(out/(name+'.png'))
 
 
+def check_frame(path, original):
+    """The pack builder's integrity check (hd-pack-build.verify): RGBA PNG, exact 2x, alpha byte-exact."""
+    with Image.open(path) as img:
+        img.load()
+        if img.format != 'PNG' or img.mode != 'RGBA':
+            return 'not RGBA PNG'
+        if img.size != (original.width*2, original.height*2):
+            return 'not 2x'
+        expected = original.getchannel('A').resize(img.size, Image.Resampling.NEAREST)
+        if img.getchannel('A').tobytes() != expected.tobytes():
+            return 'alpha mismatch'
+    return None
+
+
+def assert_standard_zip(archive):
+    """The Android updater rejects ZIP64 (hd-pack-build.assert_standard_zip)."""
+    with open(archive, 'rb') as handle:
+        handle.seek(0, 2)
+        handle.seek(max(0, handle.tell() - 128))
+        tail = handle.read()
+    end = tail.rfind(b'PK\x05\x06')
+    if end < 0:
+        raise ValueError(f'no end-of-central-directory record: {archive}')
+    # A ZIP64 EOCD locator sits exactly 20 bytes before the classic record.
+    if end >= 20 and tail[end - 20:end - 16] == b'PK\x06\x07':
+        raise ValueError(f'ZIP64 end-of-central-directory: {archive}')
+    with zipfile.ZipFile(archive) as z:
+        infos = z.infolist()
+    if len(infos) >= MAX_ZIP_ENTRIES:
+        raise ValueError(f'too many entries for a standard ZIP: {len(infos)}')
+    for info in infos:
+        if max(info.file_size, info.compress_size, info.header_offset) >= 0xFFFFFFFE:
+            raise ValueError(f'ZIP64 needed for {info.filename}')
+    return len(infos)
+
+
+def write_zip(archive, entries):
+    """One classic ZIP; a set that cannot fit it must be split, not grown into ZIP64."""
+    if len(entries) >= MAX_ZIP_ENTRIES:
+        raise ValueError(f'{archive.name}: {len(entries)} entries do not fit a standard ZIP; '
+                         'split the job range')
+    with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+        for arcname, data in entries:
+            z.writestr(arcname, data)
+    return assert_standard_zip(archive)
+
+
+def write_packs(out, jobs, originals):
+    """Per-category and per-job standard ZIPs of the selected trees, entries under ``hd/``.
+
+    A job is one range of the art list, so ``critters-0000.zip`` ships as production
+    finishes that job.  Every frame is re-checked with the pack builder's integrity test
+    against the original FRM frame before it enters an archive.
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    owners = {}; by_category = {}; written = {}
+    for job_dir in sorted(jobs.iterdir()):
+        tree = job_dir/'hd'
+        if not job_dir.is_dir() or not tree.is_dir():
+            continue
+        job = job_dir.name
+        entries = []
+        for path in sorted(tree.rglob('*.png')):
+            rel = path.relative_to(tree).as_posix()
+            if not rel.startswith('art/'):
+                raise ValueError(f'unexpected pack frame: {job} {rel}')
+            original = originals.get(rel)
+            if original is None:
+                raise ValueError(f'no original to verify {rel}')
+            error = check_frame(path, original)
+            if error:
+                raise ValueError(f'{error}: {rel}')
+            owner = owners.setdefault(rel, job)
+            if owner != job:
+                raise ValueError(f'duplicate frame {rel} in {owner} and {job}')
+            by_category.setdefault(rel.split('/')[1], []).append((rel, path))
+            entries.append(('hd/' + rel, path.read_bytes()))
+        if entries:
+            archive = out/(job + '.zip')
+            written[job] = {'group': 'job', 'frames': write_zip(archive, entries),
+                            'bytes': archive.stat().st_size}
+    for category, frames in sorted(by_category.items()):
+        archive = out/(category + '.zip')
+        if len(frames) >= MAX_ZIP_ENTRIES:
+            # Too many frames for one classic ZIP (critters): the per-job packs,
+            # each one art-list range, carry the category instead of ZIP64.
+            print(f'pack {category}.zip skipped: {len(frames)} entries exceed a standard ZIP; '
+                  'use the job-range packs')
+            continue
+        entries = [('hd/' + rel, path.read_bytes()) for rel, path in frames]
+        written[category] = {'group': 'category', 'frames': write_zip(archive, entries),
+                             'bytes': archive.stat().st_size}
+    return written
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--production', type=Path, default=Path('/ai/wasteland-hd/production-lightning4'))
@@ -227,6 +409,9 @@ def main(argv=None):
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--judge-budget', type=int, default=600)
     p.add_argument('--no-judge', action='store_true')
+    p.add_argument('--pack-out', type=Path, default=None,
+                   help='also write per-category and per-job standard ZIPs of the selected '
+                        'trees (entries under hd/, no ZIP64) into this directory')
     args = p.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
     plan = json.loads((args.production/'plan.json').read_text())
@@ -267,21 +452,26 @@ def main(argv=None):
         repair_state = json.loads(repair_state_path.read_text()).get('groups', {})
         unresolved = {k for k, v in state['groups'].items() if v.get('fallback')}
         if not unresolved.issubset(repair_state): continue
-        roots = source_roots(args.production, args.repair, work.name)
+        roots = source_roots(args.production, args.repair, work.name,
+                             critter=work.name.split('-')[0] == 'critters')
         for direction, group in inventory['groups'].items():
             for f in group['frames']:
                 if f['rel'] not in originals:
                     originals[f['rel']] = qa.original_frame(game, {}, f['rel'])
-            found = candidates(group, roots, originals, wall_pairs, tile_pairs, reference)
+            # Critter directions are gated by the flicker verdict production recorded.
+            flicker = (flicker_verdict(state, direction)
+                       if group['frames'][0]['rel'].startswith(CRITTER_ART) else None)
+            found = candidates(group, roots, originals, wall_pairs, tile_pairs, reference,
+                               refuse=production_refuser(flicker))
             fb = args.out/'fallback'/work.name/'hd'
             found.append(fallback(group, originals, fb))
             prior = repair_state.get(direction, {})
             baseline = ('repair' if (prior.get('source') or '').startswith(str(args.repair))
                         else 'fallback' if prior.get('fallback') else 'production')
-            records.append((work.name, direction, group, found, baseline))
+            records.append((work.name, direction, group, found, baseline, flicker))
     # Deterministic, category-stratified calibration sample.
     sampled = Counter()
-    for job, direction, group, found, baseline in sorted(records, key=lambda r: hashlib.sha256(r[1].encode()).digest()):
+    for job, direction, group, found, baseline, flicker in sorted(records, key=lambda r: hashlib.sha256(r[1].encode()).digest()):
         if not key: break
         category = job.split('-')[0]
         if sampled[category] >= 20: continue
@@ -299,7 +489,7 @@ def main(argv=None):
                 if len(swaps) < 50:
                     reverse = judge_pair(originals[rel], ib, ia, args.out/'judge-cache', budget, key, swap=True)
                     if reverse: swaps.append((answer, reverse))
-    for job, direction, group, found, baseline in records:
+    for job, direction, group, found, baseline, flicker in records:
         scored = [item for item in found if item['frames']]
         if len(scored) < 2 or not key: continue
         category = job.split('-')[0]
@@ -323,16 +513,15 @@ def main(argv=None):
                                         'swap_pairs': len(swaps), 'swap_consistency': swap_rate,
                                         'judge_trusted': judge_trusted}, indent=2))
     selections = {}; spot = []; switches = Counter()
-    for job, direction, group, found, baseline in records:
-        for item in found:
-            item['score'] = round(sum(score(f['features'], weights) for f in item['frames'].values())/max(1,len(item['frames'])), 6)
-        found.sort(key=lambda x: x['score'], reverse=True)
-        chosen = found[0]
-        if judge_trusted and len(found)>1 and found[0]['score']-found[1]['score'] < .025 and budget['used'] < budget['limit']:
-            rel = group['frames'][0]['rel']; a,b = found[:2]
+    for job, direction, group, found, baseline, flicker in records:
+        chosen, reason, ordered = choose(found, weights)
+        passing = [item for item in ordered if item['frames']]
+        # A judge tie-break may only pick between passing HD candidates.
+        if judge_trusted and len(passing) > 1 and passing[0]['score']-passing[1]['score'] < .025 and budget['used'] < budget['limit']:
+            rel = group['frames'][0]['rel']; a,b = passing[:2]
             with Image.open(Path(a['root'])/rel) as ia, Image.open(Path(b['root'])/rel) as ib:
-                verdict = judge_pair(originals[rel], ia, ib, args.out/'judge-cache', budget, key)
-            if verdict == 'B': chosen = b
+                answer = judge_pair(originals[rel], ia, ib, args.out/'judge-cache', budget, key)
+            if answer == 'B': chosen = b
         source = chosen['source']
         selected = 'production' if source.startswith('production') else 'repair' if source.startswith('repair') else 'fallback'
         switches[(job, baseline, selected)] += 1
@@ -340,12 +529,14 @@ def main(argv=None):
         for f in group['frames']:
             src = Path(chosen['root'])/f['rel']; dst = output/f['rel']; dst.parent.mkdir(parents=True,exist_ok=True)
             shutil.copyfile(src, dst)
-        row = {'chosen_source': source, 'chosen_root': chosen['root'], 'reason': 'gate then fitted detail score',
-               'score': chosen['score'], 'candidates': [{k:v for k,v in c.items() if k != 'frames'} for c in found],
+        row = {'chosen_source': source, 'chosen_root': chosen['root'], 'reason': reason,
+               'score': chosen['score'], 'candidates': [{k:v for k,v in c.items() if k != 'frames'} for c in ordered],
                'frames': chosen['frames'], 'baseline': baseline}
+        if flicker is not None:
+            row['flicker'] = {k: flicker.get(k) for k in ('pass', 'reason', 'animation', 'keyframe')}
         selections.setdefault(job,{})[direction] = row
         spot.append({'job': job, 'direction': direction, 'chosen_source': source, 'baseline': baseline,
-                     'score_gap': round(found[0]['score']-found[1]['score'],6) if len(found)>1 else 0,
+                     'score_gap': round(passing[0]['score']-passing[1]['score'],6) if len(passing)>1 else 0,
                      'preview': group['frames'][0]['rel']})
     for job, values in selections.items():
         (args.out/'jobs'/job/'selection.json').write_text(json.dumps({'groups': values}, indent=2))
@@ -361,8 +552,20 @@ def main(argv=None):
         stratified.extend(r for r in spot if (r['job'],r['direction']) not in seen)
     (args.out/'spotcheck.json').write_text(json.dumps(stratified[:40], indent=2))
     contact_sheets(args.out, spot, originals)
+    fallback_by_category = Counter()
+    for job, values in selections.items():
+        # Accumulate: one category spans several jobs.
+        fallback_by_category[job.split('-')[0]] += sum(
+            1 for row in values.values() if row['chosen_source'] in FALLBACK)
+    fallback_by_category = +fallback_by_category  # drop the zero entries
     summary = {'jobs': len(selections), 'directions': len(records), 'switches': [{'job':j,'from':a,'to':b,'count':n} for (j,a,b),n in sorted(switches.items())],
+               'fallback': dict(sorted(fallback_by_category.items())),
+               'fallback_total': sum(fallback_by_category.values()),
                'judge_calls': budget['used'], 'judge_agreement': agreement, 'swap_consistency': swap_rate, 'judge_trusted': judge_trusted}
+    if args.pack_out:
+        summary['packs'] = write_packs(args.pack_out, args.out/'jobs', originals)
+        for name, info in sorted(summary['packs'].items()):
+            print(f"pack {name}.zip {info['frames']} frames {info['bytes']} bytes")
     (args.out/'summary.json').write_text(json.dumps(summary, indent=2)); print(json.dumps(summary, indent=2))
     return 0
 
