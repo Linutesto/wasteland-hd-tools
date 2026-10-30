@@ -276,7 +276,7 @@ def main(argv=None):
             fb = args.out/'fallback'/work.name/'hd'
             found.append(fallback(group, originals, fb))
             prior = repair_state.get(direction, {})
-            baseline = ('repair' if prior.get('source', '').startswith(str(args.repair))
+            baseline = ('repair' if (prior.get('source') or '').startswith(str(args.repair))
                         else 'fallback' if prior.get('fallback') else 'production')
             records.append((work.name, direction, group, found, baseline))
     # Deterministic, category-stratified calibration sample.
