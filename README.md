@@ -9,6 +9,22 @@ pack it as `hd.zip` for the game.
 No Fallout 2 file is included here, and nothing here sends your files
 anywhere: the model runs on your computer.
 
+## Just want to play? You don't need this repository
+
+These tools are for **making** HD art. To **play** the game with it,
+install Wasteland Reborn: the released installer and the **Wasteland HD**
+app download the finished packs by themselves — no Python, no graphics
+card, nothing from this repo. Step-by-step guides, one action per step:
+
+- [Windows install guide (English)](https://github.com/Linutesto/wasteland-reborn-installer/blob/main/docs/INSTALL-WINDOWS.md)
+- [Guide Windows (en français)](https://github.com/Linutesto/wasteland-reborn-installer/blob/main/docs/INSTALL-WINDOWS.fr.md)
+- [Troubleshooting (English)](https://github.com/Linutesto/wasteland-reborn-installer/blob/main/docs/TROUBLESHOOTING.md)
+  · [Dépannage (français)](https://github.com/Linutesto/wasteland-reborn-installer/blob/main/docs/TROUBLESHOOTING.fr.md)
+
+Downloads and releases live in
+[wasteland-reborn-installer](https://github.com/Linutesto/wasteland-reborn-installer/releases/latest).
+Everything below is for people who want to **make** their own art.
+
 ## Play it (you need Fallout 2)
 
 You need your own Fallout 2 from Steam, GOG or Epic. Without it, nothing
