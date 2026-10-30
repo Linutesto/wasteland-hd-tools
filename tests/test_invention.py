@@ -105,6 +105,35 @@ def test_emissive_lift_is_not_dark_structure():
     assert scenery['verdict'] != 'invented_texture'
 
 
+def test_source_exact_art_is_not_invention():
+    # Scanline sprites (interface art such as bomb1/pipx) have no interior at
+    # all: their nearest-neighbour 2x silhouette is far sharper than any
+    # bicubic resample of the source, so untouched game art used to measure as
+    # invented texture and the original-art fallback could never ship.
+    original = Image.new('RGBA', (65, 65), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(original)
+    for y in range(3, 64, 2):
+        draw.rectangle((0, y, 64, y), fill=(90, 220, 90, 255))
+    base = original.resize((130, 130), Image.Resampling.NEAREST)
+    assert invention.source_exact(base, original)
+    measured = invention._single_scale(base, original, sprite=False)
+    assert measured['novel_fraction'] > invention.TEXTURE_AREA_LIMIT
+    # With the exemption the untouched frame is clean on both paths.
+    assert invention.score(base, original, kind='tiles', floor=False)['verdict'] == 'clean'
+    assert invention.score(base, original, kind='misc')['verdict'] == 'clean'
+    # A junction can still fail untouched art: it is the pair that breaks.
+    assert invention.score(base, original, kind='walls',
+                           seam_delta=invention.WALL_SEAM_DELTA_LIMIT + 1)['verdict'] == 'unmatched_wall'
+    # Floor tiles keep their own verdict on the very same frame.
+    assert invention.score(base, original, kind='tiles',
+                           seam_delta=invention.SEAM_DELTA_LIMIT + 1)['verdict'] == 'unmatched_floor'
+    # Anything that differs from the source is measured exactly as before.
+    changed = base.copy()
+    ImageDraw.Draw(changed).rectangle((40, 40, 52, 52), fill=(200, 40, 40, 255))
+    assert not invention.source_exact(changed, original)
+    assert invention.score(changed, original, kind='tiles', floor=False)['verdict'] == 'invented_texture'
+
+
 def _wall_frm(width, height):
     """A minimal single-frame wall FRM: opaque rectangle, mortar rows."""
     import struct
@@ -237,6 +266,42 @@ def test_wall_seam_delta_measures_only_the_extra_break():
             if alpha:
                 px[x, y] = (max(0, r - 80), max(0, g - 80), min(255, bl + 80), alpha)
     assert invention.wall_seam_delta(base_a, broken, a, broken_src, placement) == 0.0
+
+
+def _bright_columns(image, columns, amount=70):
+    """The 2x frame with `columns` lifted - a redraw's bright edge band."""
+    out = image.copy()
+    px = out.load()
+    for x in columns:
+        for y in range(out.height):
+            r, g, bl, alpha = px[x, y]
+            if alpha:
+                px[x, y] = (min(255, r + amount), min(255, g + amount),
+                            min(255, bl + amount), alpha)
+    return out
+
+
+def test_wall_seam_delta_sees_a_rim_the_colour_band_cannot():
+    """The colour band compares each side with the *other* sprite, so pieces
+    that are equally bright at the contact look fine there; the pair still
+    steps twice across the junction - the light line a redraw leaves on a
+    frame's own edge where the source art has none."""
+    a, b, placement = _wall_pair()
+    base_a = a.resize((80, 120), Image.Resampling.NEAREST)
+    base_b = b.resize((80, 120), Image.Resampling.NEAREST)
+    assert invention.wall_seam_delta(base_a, base_b, a, b, placement) == 0.0
+    lit_a = _bright_columns(base_a, range(74, 80))   # a's right edge, at the contact
+    lit_b = _bright_columns(base_b, range(0, 6))     # b's left edge, over it
+    colour, line = invention.wall_junction_terms(lit_a, lit_b, a, b, placement)
+    assert colour <= invention.WALL_SEAM_DELTA_LIMIT, 'the colour band alone is blind to it'
+    assert line > invention.WALL_SEAM_DELTA_LIMIT, 'the step along the contact is not'
+    assert invention.wall_seam_delta(lit_a, lit_b, a, b, placement) > invention.WALL_SEAM_DELTA_LIMIT
+    # The shape seen on the shipped walls: one frame's 1-px edge rim alone.
+    rim = _bright_columns(base_b, range(0, 1), 60)
+    assert invention.wall_seam_delta(base_a, rim, a, b, placement) > invention.WALL_SEAM_DELTA_LIMIT
+    # The same lift in the source pair is the baseline, not a failure.
+    lifted = _bright_columns(b, range(0, 6))
+    assert invention.wall_seam_delta(lit_a, lit_b, a, lifted, placement) <= 1.0
 
 
 def test_unmatched_wall_verdict_only_for_walls():

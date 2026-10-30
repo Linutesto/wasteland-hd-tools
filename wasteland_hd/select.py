@@ -29,7 +29,7 @@ def source_roots(prod, repair, job):
     roots += [(f'production_{x.name}', x/'hd') for x in sorted(p.glob('attempt-*'))]
     roots += [(f'repair_{x.relative_to(r).as_posix()}', x) for x in sorted((r/'attempts').glob('**/candidate/hd'))]
     roots += [('repair_accepted', r/'hd')]
-    roots += [(f'repair_{x.name}', x) for x in (r/'edge-lock', r/'junction-lock') if x.exists()]
+    roots += [(f'repair_{x.name}', x) for x in (r/'edge-lock', r/'junction-lock', r/'edge-restore') if x.exists()]
     return roots
 
 

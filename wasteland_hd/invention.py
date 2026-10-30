@@ -33,6 +33,20 @@ MINOR_AREA_LIMIT = 0.04
 WALL_SEAM_BAND = 6          # 2x px sampled on each side of a junction contact
 WALL_SEAM_MIN_SAMPLES = 16  # fewer junction px than this cannot support a verdict
 WALL_SEAM_DELTA_LIMIT = 18.0  # calibrated on labelled world-seam junctions
+# Measured quantity version: the seam cache is keyed on it, so changing what a
+# junction delta *is* (the line term below, added October 30) re-measures every
+# junction instead of trusting deltas the previous metric produced.
+WALL_SEAM_METRIC = 2
+# A redraw can leave a bright 1-px rim on a frame's alpha boundary.  Where two
+# wall pieces overlap that rim reads as a light vertical line running the whole
+# wall height, which the 6-px colour band averages away (it compares each band
+# pixel with the *other* sprite, not with its own neighbour).  The junction
+# therefore also measures the sharpest 1-2 px column step along the contact and
+# subtracts the same step the original pair has, so the source's own joints
+# (posts, door frames) stay the baseline.  Shares WALL_SEAM_DELTA_LIMIT: both
+# terms are an extra brightness break, in the same 0-255 units.
+WALL_LINE_WINDOW = 2        # 2x px of context kept around each row's contact
+WALL_LINE_MIN_ROWS = 8      # fewer junction rows than this cannot hold a line
 
 # Non-floor sprite calibration (walls/scenery/items/misc, October 29 2026
 # world-seam review). Sprites are alpha silhouettes, often thin strips or tiny
@@ -149,6 +163,18 @@ def _sprite_verdict(high):
     return 'clean'
 
 
+def source_exact(hd: Image.Image, original: Image.Image) -> bool:
+    """True when the frame *is* the original art resampled 2x (nearest).
+
+    Nothing was generated there, so no measurement of novelty can be true:
+    any difference a reviewer sees is the source's own pixel grid.  The
+    comparison is exact, which is what makes the verdict safe to trust.
+    """
+    return np.array_equal(np.asarray(hd.convert('RGBA')),
+                          np.asarray(original.convert('RGBA')
+                                     .resize(hd.size, Image.Resampling.NEAREST)))
+
+
 def score(hd: Image.Image, original: Image.Image, *, seam_delta=0.0, floor=True, kind='tiles'):
     """Return measurements at native and 2x sizes and a four-way verdict."""
     if kind not in KINDS:
@@ -159,6 +185,9 @@ def score(hd: Image.Image, original: Image.Image, *, seam_delta=0.0, floor=True,
     # Sprite border error is measured at the alpha silhouette, where AA and
     # erosion are normal; only floor tiles can be unmatched against neighbours.
     floor = floor and not sprite
+    # Untouched game art cannot hold invented texture.  Only a junction can
+    # still fail it, and floor tiles (floor=True) keep their calibrated path.
+    untouched = not floor and source_exact(hd, original)
     native = _single_scale(hd.resize(original.size, Image.Resampling.BOX), original, sprite=sprite)
     high = _single_scale(hd, original, sprite=sprite)
     # At native scale, source pixels are themselves strongly stair-stepped;
@@ -172,6 +201,8 @@ def score(hd: Image.Image, original: Image.Image, *, seam_delta=0.0, floor=True,
         # A wall piece that does not continue into its placed neighbour on the
         # map (colour step or brick phase across the contact) is unmatched.
         verdict = 'unmatched_wall'
+    elif untouched:
+        verdict = 'clean'
     elif sprite:
         verdict = _sprite_verdict(high)
     elif area > TEXTURE_AREA_LIMIT or cluster > TEXTURE_CLUSTER_LIMIT or (flat > FLAT_DAMAGE_LIMIT and cluster > 0.025) or high['dark_novel'] > 0.025:
@@ -480,14 +511,46 @@ def _band_gap(rgb_a, rgb_b, mask_a, mask_b, sel_a, sel_b):
     return float(values.mean()), len(values)
 
 
-def wall_seam_delta(hd_a, hd_b, orig_a, orig_b, placement):
-    """Extra colour/pattern break an HD pair shows across a junction.
+def _line_step(rgb, valid, sel, rows):
+    """Sharpest 1-2 px step in each junction row, at that row's own contact.
+
+    Only columns within WALL_LINE_WINDOW of the row's own contact count, so a
+    diagonal junction is measured where its two pieces actually meet instead
+    of over the whole bounding box of the contact.  Each row contributes its
+    largest step and the median over rows is returned: a line running the
+    whole contact (what a reader sees as a light vertical line) lifts nearly
+    every row at the same column, while texture that changes column from row
+    to row cancels out.  `valid` keeps columns that do not carry the contact
+    from stepping against transparent black.
+    """
+    if len(rows) < WALL_LINE_MIN_ROWS:
+        return 0.0
+    near = binary_dilation(sel, structure=np.ones((1, 3), bool),
+                           iterations=WALL_LINE_WINDOW)
+    step = np.abs(np.diff(rgb.mean(axis=2), axis=1))
+    pair = valid[:, :-1] & valid[:, 1:] & near[:, :-1] & near[:, 1:]
+    row_step = np.where(pair, step, -np.inf).max(axis=1)
+    row_step = row_step[np.isfinite(row_step)]
+    if len(row_step) < WALL_LINE_MIN_ROWS:
+        return 0.0
+    return float(np.median(row_step))
+
+
+def wall_junction_terms(hd_a, hd_b, orig_a, orig_b, placement):
+    """(colour excess, line excess) of one junction - what wall_seam_delta takes the worse of.
 
     Both HD pieces are composited at their real relative offset at 2x, the
     junction band is measured on each side against the nearest pixel of the
     other piece, and the same measurement on the original pair at 2x
     (nearest) is subtracted: intentional source joints (posts, door frames)
     are the baseline, not a failure.
+
+    The second term is the sharpest 1-2 px column step along the same contact,
+    likewise less the original pair's step, taken in both draw orders since
+    which piece covers which is the engine's, not ours.  The colour band
+    compares each side with the *other* sprite, so a bright rim a redraw
+    leaves on a frame's own edge can agree across the contact and still read
+    as a light vertical line where the source art has none.
     """
     try:
         canvases, _a0, _b0 = _pair_2x(hd_a, hd_b, placement, nearest=False)
@@ -495,16 +558,40 @@ def wall_seam_delta(hd_a, hd_b, orig_a, orig_b, placement):
         canvases, _a1, _b1 = _pair_2x(orig_a, orig_b, placement, nearest=True)
         (oa, oma), (ob, omb) = canvases
     except (ValueError, OSError):
-        return 0.0
+        return 0.0, 0.0
     sel_a, sel_b = junction_band(ma, mb)
     if not (sel_a.any() or sel_b.any()):
-        return 0.0
+        return 0.0, 0.0
     hd_gap, n = _band_gap(ha, hb, ma, mb, sel_a, sel_b)
     if n < WALL_SEAM_MIN_SAMPLES:
-        return 0.0
+        return 0.0, 0.0
     src_sel_a, src_sel_b = junction_band(oma, omb)
     src_gap, _ = _band_gap(oa, ob, oma, omb, src_sel_a, src_sel_b)
-    return max(0.0, hd_gap - src_gap)
+    colour = max(0.0, hd_gap - src_gap)
+    sel = sel_a | sel_b
+    rows = np.flatnonzero(sel.any(axis=1))
+    if len(rows) < WALL_LINE_MIN_ROWS:
+        return colour, 0.0
+    # Alpha is the source's own, so one validity mask fits both pairs; only the
+    # pixels that carry the contact may set the profile.
+    valid = ma | mb
+    hd_line = max(_line_step(np.where(mb[..., None], hb, ha), valid, sel, rows),
+                  _line_step(np.where(ma[..., None], ha, hb), valid, sel, rows))
+    src_line = max(_line_step(np.where(omb[..., None], ob, oa), valid, sel, rows),
+                   _line_step(np.where(oma[..., None], oa, ob), valid, sel, rows))
+    return colour, max(0.0, hd_line - src_line)
+
+
+def wall_seam_delta(hd_a, hd_b, orig_a, orig_b, placement):
+    """Extra colour/pattern break an HD pair shows across a junction.
+
+    The worse of the two measurements wall_junction_terms makes: the mean
+    colour gap across the contact, and the sharpest column step along it.
+    Both are brightness breaks in the same 0-255 units, so both are judged
+    against WALL_SEAM_DELTA_LIMIT.
+    """
+    colour, line = wall_junction_terms(hd_a, hd_b, orig_a, orig_b, placement)
+    return max(colour, line)
 
 
 def wall_junction_mask(original, junctions):
