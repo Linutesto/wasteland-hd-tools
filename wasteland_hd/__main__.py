@@ -84,8 +84,18 @@ def cmd_upscale(args):
     from .upscale import ANIMATION_PROMPT, LIGHTNING, PROMPT, Comfy, lanczos, render_matches, write_render_receipt
     os.makedirs(os.path.join(args.work, "upscaled"), exist_ok=True)
     prompt = ANIMATION_PROMPT if args.prompt == "animation" else PROMPT
-    fast = Comfy(args.comfy, steps=8, cfg=1.0, lora=LIGHTNING[8], seed=args.seed, prompt=prompt)
-    full = Comfy(args.comfy, steps=args.steps, seed=args.seed, prompt=prompt)
+    prompt_file = getattr(args, "prompt_file", None)
+    if prompt_file:
+        # Prompt experiments (docs/CRITTER-PROMPT-REPORT.md) pass their text here.
+        with open(prompt_file) as stream:
+            prompt = stream.read().strip()
+        if not prompt:
+            sys.exit(f"empty prompt file: {prompt_file}")
+    denoise = getattr(args, "denoise", 1.0)
+    if not 0 < denoise <= 1:
+        sys.exit("--denoise must be in (0, 1]")
+    fast = Comfy(args.comfy, steps=8, cfg=1.0, lora=LIGHTNING[8], seed=args.seed, prompt=prompt, denoise=denoise)
+    full = Comfy(args.comfy, steps=args.steps, seed=args.seed, prompt=prompt, denoise=denoise)
 
     def model_for(sheet):
         if args.backend == "lanczos":
@@ -460,6 +470,10 @@ def main():
                            help="animation: for sheets packed one animation per row (critters)")
             p.add_argument("--render-scale", type=int, default=2, choices=(2, 3, 4),
                            help="draw sheets at this scale; cut shrinks them to 2x (4: finer detail, ~4x slower)")
+            p.add_argument("--prompt-file", help="use the prompt text in this file instead of --prompt (experiments)")
+            p.add_argument("--denoise", type=float, default=1.0,
+                           help="KSampler denoise (experiments; production passes its own: "
+                                "1.0 static, 0.55 animation)")
         if name in ("pack", "all"):
             p.add_argument("--out", default="hd.zip")
     args = ap.parse_args()

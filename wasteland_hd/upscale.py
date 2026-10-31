@@ -17,12 +17,19 @@ PROMPT = (
     "cloth, metal and skin. Keep the background flat grey. Do not add, remove or merge objects."
 )
 # Critter sheets (sheets.pack by_animation): one row per animation direction.
+# Identity lock (docs/CRITTER-PROMPT-REPORT.md): naming "face, hair, beard, skin"
+# here made the model *draw* them on helmeted critters, and at denoise 1.0 it also
+# redrew the suit's bulk.  The wording never names facial features and only allows
+# detail inside shapes the input already has; production renders animation sheets
+# at the reduced denoise in production.SETTINGS["animation_denoise"].
 ANIMATION_PROMPT = (
     "This is a sheet of animation frames from the isometric 1990s game Fallout 2 on a flat grey background. "
     "Each row shows consecutive frames of the same character in one movement. Upscale it to high resolution, "
-    "like remastered HD game art. Draw the character identically in every frame of a row: the same face, hair, "
-    "beard, skin, clothes, straps, armbands, patterns, colours and lighting; only the pose changes. Keep every "
-    "sprite exactly where it is, with the same outline, shape and perspective. Keep the background flat grey. "
+    "like remastered HD game art. Redraw every sprite as exactly the character the input shows: the same "
+    "costume, headgear, gear, body proportions, patterns, colours and lighting in every frame of a row; only "
+    "the pose changes. Add finer detail only inside the shapes the input already has; never redraw, add, "
+    "remove or reshape any part of the character or what it wears. Keep every sprite exactly where it is, "
+    "with the same outline, shape and perspective. Keep the background flat grey. "
     "Do not add, remove or merge objects."
 )
 NEGATIVE = "blurry, smeared, oversmoothed, watercolor, new objects, text, watermark, changed layout, merged sprites"
@@ -45,9 +52,13 @@ def lanczos(src, dst, scale=2):
 
 
 class Comfy:
-    def __init__(self, url="http://127.0.0.1:8188", steps=30, cfg=4.0, seed=42, models=QWEN_MODELS, lora=None, prompt=PROMPT):
+    def __init__(self, url="http://127.0.0.1:8188", steps=30, cfg=4.0, seed=42, models=QWEN_MODELS, lora=None,
+                 prompt=PROMPT, denoise=1.0):
         self.url, self.steps, self.cfg, self.seed, self.models = url.rstrip("/"), steps, cfg, seed, models
         self.prompt = prompt
+        # KSampler denoise: 1.0 regenerates, lower keeps the lanczos input's
+        # structure (the repair ladder redraws failed directions at 0.55/0.4).
+        self.denoise = denoise
         # Lightning LoRA (lightx2v): 4 or 8 steps at cfg 1 instead of 30 at cfg 4.
         self.lora = lora
         self.timeout = 1800
@@ -80,7 +91,7 @@ class Comfy:
             "neg": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"clip": ["clip", 0], "prompt": NEGATIVE, "vae": ["vae", 0], "image1": ["scaled", 0]}},
             "enc": {"class_type": "VAEEncode", "inputs": {"pixels": ["scaled", 0], "vae": ["vae", 0]}},
             "ks": {"class_type": "KSampler", "inputs": {"model": ["ms", 0], "positive": ["pos", 0], "negative": ["neg", 0], "latent_image": ["enc", 0],
-                                                        "seed": self.seed, "steps": self.steps, "cfg": self.cfg, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+                                                        "seed": self.seed, "steps": self.steps, "cfg": self.cfg, "sampler_name": "euler", "scheduler": "simple", "denoise": self.denoise}},
             "dec": {"class_type": "VAEDecode", "inputs": {"samples": ["ks", 0], "vae": ["vae", 0]}},
             "save": {"class_type": "SaveImage", "inputs": {"images": ["dec", 0], "filename_prefix": "wasteland_hd"}},
         }

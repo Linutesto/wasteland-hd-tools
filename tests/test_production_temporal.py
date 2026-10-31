@@ -316,7 +316,14 @@ def test_temporal_option_document_on_the_live_roots_started_state(tmp_path):
         p.Controller.job_options(stub)
 
 
-def test_live_plan_resumes_byte_for_byte_with_the_option(tmp_path, monkeypatch):
+def test_live_plan_differs_only_by_the_critter_recipe_change(tmp_path, monkeypatch):
+    """The live root's plan must drift by the critter recipe *only*.
+
+    docs/CRITTER-PROMPT-REPORT.md moves plan.json aside so the running root
+    restarts with the new animation prompt/denoise; every other field (sources,
+    stamp, seeds, chunking, adoption) has to still match byte for byte, and
+    --temporal must keep leaving the document unchanged.
+    """
     if not LIVE_PLAN.is_file():
         pytest.skip("live production root not available")
     live = json.loads(LIVE_PLAN.read_text())
@@ -325,15 +332,29 @@ def test_live_plan_resumes_byte_for_byte_with_the_option(tmp_path, monkeypatch):
     argv = ["--root", str(tmp_path / "root"), "--game", live["game"],
             "--seeds", ",".join(str(seed) for seed in live["seeds"]),
             "--chunk-size", str(live["chunk_size"]), "--adopt-world", live["adopt_world"]]
+    document = None
     for extra in ([], ["--temporal"]):
         args = p.parser().parse_args(argv + extra)
-        document = p.plan_document(args, FakeGame(()), live["sources"], live["unsupported_visuals"])
-        assert json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n" == raw
-        # run()'s guard is `old != self.plan`: on a copy of the live plan it is False,
-        # so the controller resumes instead of exiting 64, with or without --temporal.
-        copy = tmp_path / ("copy-off" if not extra else "copy-on") / "plan.json"
-        copy.parent.mkdir(parents=True)
-        copy.write_text(raw)
-        assert p.read_json(copy) == document
-    # The naive alternative (a temporal key in the plan) would refuse this very root.
+        candidate = p.plan_document(args, FakeGame(()), live["sources"], live["unsupported_visuals"])
+        encoded = json.dumps(candidate, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        if document is None:
+            document, encoded_first = candidate, encoded
+        else:
+            assert encoded == encoded_first  # --temporal never changes plan bytes
+    recipe = {"animation_prompt_sha256", "animation_denoise"}
+    drifted = {key for key in set(live["settings"]) | set(document["settings"])
+               if live["settings"].get(key) != document["settings"].get(key)}
+    assert drifted == recipe, f"unexpected plan drift: {sorted(drifted - recipe)}"
+    for key, value in live.items():
+        if key != "settings":
+            assert document[key] == value, f"non-recipe plan field changed: {key}"
+    # With the live recipe restored, the document is the live file byte for byte.
+    settings = dict(live["settings"])
+    for key, value in document["settings"].items():
+        if key not in recipe:
+            assert settings.get(key) == value
+            settings[key] = value
+    restored = {**document, "settings": settings}
+    assert json.dumps(restored, indent=2, sort_keys=True, allow_nan=False) + "\n" == raw
+    # The naive alternative (a temporal key in the plan) would refuse this root.
     assert json.dumps({**document, "temporal": True}, indent=2, sort_keys=True) + "\n" != raw
