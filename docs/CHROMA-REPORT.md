@@ -1,3 +1,8 @@
+> **Superseded 2026-10-31.** Every code path this report describes was
+> deleted: the tint was never visible in real map context at game scale and
+> changed zero shipped frames. See `docs/CAST-DECISION-REPORT.md`; the code
+> lives on in commit `9c0e7d4` if it is ever wanted back.
+
 # Chroma-cast report (task K, 2026-10-30)
 
 Branch `agent/chroma`, worktree `~/agent-wt/chroma`. Closes the open item of
