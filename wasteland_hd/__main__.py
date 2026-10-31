@@ -473,7 +473,7 @@ def main():
             p.add_argument("--prompt-file", help="use the prompt text in this file instead of --prompt (experiments)")
             p.add_argument("--denoise", type=float, default=1.0,
                            help="KSampler denoise (experiments; production passes its own: "
-                                "1.0 static, 0.55 animation)")
+                                "1.0 static, 0.80 animation)")
         if name in ("pack", "all"):
             p.add_argument("--out", default="hd.zip")
     args = ap.parse_args()

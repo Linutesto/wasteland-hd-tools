@@ -67,8 +67,8 @@ New production renders use **Qwen Image Edit 2511 Lightning 8-step**, LoRA
 `Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors` at strength 1,
 **8 Euler/simple steps, cfg 1, seed 42, AuraFlow shift 3**, and Lanczos input
 scaling; static sheets render at **denoise 1** and animation (critter) sheets at
-**denoise 0.55** (`animation_denoise`), the recipe that keeps helmets, hoods and
-suit bulk exactly as drawn (`docs/CRITTER-PROMPT-REPORT.md`). Loaders are `qwen_image_edit_2511_fp8mixed.safetensors`,
+**denoise 0.80** (`animation_denoise`), the highest tested rung that keeps
+helmets, hoods and suit bulk exactly as drawn (`docs/CRITTER-PROMPT-REPORT.md`). Loaders are `qwen_image_edit_2511_fp8mixed.safetensors`,
 `qwen_2.5_vl_7b_fp8_scaled.safetensors`, and `qwen_image_vae.safetensors`.
 PROMPT, ANIMATION_PROMPT and NEGATIVE from `wasteland_hd/upscale.py` are pinned
 by SHA256 in the production plan and verified against each PNG's ComfyUI graph.

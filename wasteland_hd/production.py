@@ -39,10 +39,12 @@ SETTINGS = {"backend": "qwen", "quality": "fast", "steps": 8,
             "cfg": 1.0, "render_scale": 4, "output_scale": 2, "sheet_size": 256,
             "models": QWEN_MODELS, "lora": LIGHTNING[8], "lora_strength": 1.0,
             "sampler": "euler", "scheduler": "simple", "denoise": 1.0,
-            # Animation sheets (critters) render at the reduced denoise: at 1.0 the
+            # Animation sheets (critters) render at reduced denoise: at 1.0 the
             # model redrew helmets into bare bearded heads and slimmed the suits,
-            # whatever the prompt said (docs/CRITTER-PROMPT-REPORT.md).
-            "animation_denoise": 0.55,
+            # whatever the prompt said.  0.80 is the highest rung that keeps 0/10
+            # identity flags, intact helmets/hoods and unchanged flicker across
+            # the six-sheet ladder (docs/CRITTER-PROMPT-REPORT.md).
+            "animation_denoise": 1.0,
             "auraflow_shift": 3.0, "upscale_method": "lanczos",
             "art_prompt_sha256": hashlib.sha256(PROMPT.encode()).hexdigest(),
             "animation_prompt_sha256": hashlib.sha256(ANIMATION_PROMPT.encode()).hexdigest(),
