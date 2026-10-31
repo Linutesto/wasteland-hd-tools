@@ -65,17 +65,20 @@ A single exceptionally large animation can still exceed typical memory needs.
 
 New production renders use **Qwen Image Edit 2511 Lightning 8-step**, LoRA
 `Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors` at strength 1,
-**8 Euler/simple steps, cfg 1, seed 42, AuraFlow shift 3, denoise 1**, and
-Lanczos input scaling. Loaders are `qwen_image_edit_2511_fp8mixed.safetensors`,
+**8 Euler/simple steps, cfg 1, seed 42, AuraFlow shift 3**, and Lanczos input
+scaling; static sheets render at **denoise 1** and animation (critter) sheets at
+**denoise 0.80** (`animation_denoise`), the highest tested rung that keeps
+helmets, hoods and suit bulk exactly as drawn (`docs/CRITTER-PROMPT-REPORT.md`). Loaders are `qwen_image_edit_2511_fp8mixed.safetensors`,
 `qwen_2.5_vl_7b_fp8_scaled.safetensors`, and `qwen_image_vae.safetensors`.
 PROMPT, ANIMATION_PROMPT and NEGATIVE from `wasteland_hd/upscale.py` are pinned
 by SHA256 in the production plan and verified against each PNG's ComfyUI graph.
 Native sheets are **256**, Qwen renders at **4×**, and final RGBA frame output
 is cut down to **2×**, with alpha copied by exact nearest-neighbour scaling.
 The model/scale/seed settings are verified before a generated PNG can be cut.
-The `upscale --quality full/auto` CLI modes remain for explicit experimental
-use only; the durable production controller always selects Lightning, for
-animations as well as static sheets. Oversize source
+The `upscale --quality full/auto` CLI modes, and the `--prompt-file`/`--denoise`
+experiment overrides, remain for explicit experimental use only; the durable
+production controller always selects Lightning, for animations as well as static
+sheets, and passes its own denoise per sheet type. Oversize source
 sprites necessarily use larger sheets, as in `sheets.pack`; that exception
 can still cause model placement drift. Animated art and every critter use
 `by_animation=True` packing and the animation prompt. Very long directions

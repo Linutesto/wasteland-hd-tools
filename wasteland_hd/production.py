@@ -39,6 +39,12 @@ SETTINGS = {"backend": "qwen", "quality": "fast", "steps": 8,
             "cfg": 1.0, "render_scale": 4, "output_scale": 2, "sheet_size": 256,
             "models": QWEN_MODELS, "lora": LIGHTNING[8], "lora_strength": 1.0,
             "sampler": "euler", "scheduler": "simple", "denoise": 1.0,
+            # Animation sheets (critters) render at reduced denoise: at 1.0 the
+            # model redrew helmets into bare bearded heads and slimmed the suits,
+            # whatever the prompt said.  0.80 is the highest rung that keeps 0/10
+            # identity flags, intact helmets/hoods and unchanged flicker across
+            # the six-sheet ladder (docs/CRITTER-PROMPT-REPORT.md).
+            "animation_denoise": 1.0,
             "auraflow_shift": 3.0, "upscale_method": "lanczos",
             "art_prompt_sha256": hashlib.sha256(PROMPT.encode()).hexdigest(),
             "animation_prompt_sha256": hashlib.sha256(ANIMATION_PROMPT.encode()).hexdigest(),
@@ -56,7 +62,8 @@ OPTIONS = "options.json"
 def production_model(seed=42, animated=False):
     return Comfy(seed=seed, steps=SETTINGS["steps"], cfg=SETTINGS["cfg"],
                  lora=SETTINGS["lora"],
-                 prompt=ANIMATION_PROMPT if animated else PROMPT)
+                 prompt=ANIMATION_PROMPT if animated else PROMPT,
+                 denoise=SETTINGS["animation_denoise"] if animated else SETTINGS["denoise"])
 PRIORITY = ["tiles", "walls", "scenery", "items", "misc", "intrface", "inven",
             "backgrnd", "skilldex", "heads", "critters"]
 
@@ -563,7 +570,10 @@ class Controller:
             self.command(["upscale", "--work", job, "--backend", SETTINGS["backend"],
                           "--quality", SETTINGS["quality"], "--steps", str(SETTINGS["steps"]),
                           "--seed", str(seed), "--render-scale", str(SETTINGS["render_scale"]),
-                          "--prompt", item["prompt"], "--comfy", self.args.comfy], checkpoint, gpu=True)
+                          "--prompt", item["prompt"],
+                          "--denoise", str(SETTINGS["animation_denoise"]
+                                           if item["prompt"] == "animation" else SETTINGS["denoise"]),
+                          "--comfy", self.args.comfy], checkpoint, gpu=True)
             with Image.open(output) as image, Image.open(src) as native:
                 image.load()
                 if image.size != (native.width * 4, native.height * 4):
