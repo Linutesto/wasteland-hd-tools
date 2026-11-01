@@ -11,19 +11,12 @@ anywhere: the model runs on your computer.
 
 ## Just want to play? You don't need this repository
 
-These tools are for **making** HD art. To **play** the game with it,
-install Wasteland Reborn: the released installer and the **Wasteland HD**
-app download the finished packs by themselves — no Python, no graphics
-card, nothing from this repo. Step-by-step guides, one action per step:
+These tools are for **making** HD art. For downloads and player instructions, use the installer repository's single player entry point:
 
-- [Windows install guide (English)](https://github.com/Linutesto/wasteland-reborn-installer/blob/main/docs/INSTALL-WINDOWS.md)
-- [Guide Windows (en français)](https://github.com/Linutesto/wasteland-reborn-installer/blob/main/docs/INSTALL-WINDOWS.fr.md)
-- [Troubleshooting (English)](https://github.com/Linutesto/wasteland-reborn-installer/blob/main/docs/TROUBLESHOOTING.md)
-  · [Dépannage (français)](https://github.com/Linutesto/wasteland-reborn-installer/blob/main/docs/TROUBLESHOOTING.fr.md)
+- [Wasteland Reborn v1.4 — download and install](https://github.com/Linutesto/wasteland-reborn-installer#download)
+- [HD art install guide](https://github.com/Linutesto/wasteland-reborn-installer/blob/main/docs/INSTALL-WINDOWS.md#6-hd-art-hd-edition-only)
 
-Downloads and releases live in
-[wasteland-reborn-installer](https://github.com/Linutesto/wasteland-reborn-installer/releases/latest).
-Everything below is for people who want to **make** their own art.
+The current optional phone packs are world (440 MB, 9,422 images) and heads (468 MB, 1,352 images): about 910 MB to download and about 2 GB unpacked with the game. Keep at least 3 GB free. Critter art is in production; the first pack is not published and no date is promised.
 
 ## Play it (you need Fallout 2)
 
