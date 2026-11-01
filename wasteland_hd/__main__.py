@@ -169,8 +169,9 @@ def cmd_temporal(args):
               f"material {before['material']} -> {after['material']}  "
               f"margin {temporal_stage.margin(before):.2f} -> {temporal_stage.margin(after):.2f}")
     for name, values in sorted(result["animations"].items()):
-        print(f"{name}: flicker {values['flicker']:.3f} broad {values['broad']:.3f} "
-              f"material {values['material']:.3f} -> "
+        # A one-frame animation has no flicker or broad value.
+        print(f"{name}: flicker {values['flicker']} broad {values['broad']} "
+              f"material {values['material']} -> "
               f"{'pass' if temporal_stage.passes(values) else 'FAIL'} "
               f"({values['fallbacks']}/{values['directions']} directions on original art)")
     fallbacks = sum(v["fallback"] for v in directions.values())
