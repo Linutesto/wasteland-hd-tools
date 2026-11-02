@@ -12,6 +12,8 @@ import tempfile
 import zipfile
 
 from PIL import Image
+import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 from . import invention, qa, sheets
 from .floor_fidelity import source_floor_2x
@@ -29,6 +31,22 @@ WALL_SEAM_CACHE = 'wall-seam-cache.json'
 # Bright 1-px rim: how much further an outer opaque pixel must step away from
 # its inward neighbour than the source art does before it is pulled back.
 EDGE_RESTORE_TOLERANCE = 4.0
+
+
+def source_soft_2x(original):
+    """Lanczos RGB with transparent pixels filled from nearby visible colours."""
+    orig = original.convert('RGBA')
+    nearest = orig.resize((orig.width * 2, orig.height * 2), Image.Resampling.NEAREST)
+    native = np.asarray(orig)
+    visible = native[..., 3] > 0
+    if not visible.any():
+        return nearest
+    rgb = native[..., :3].copy()
+    if not visible.all():
+        indices = distance_transform_edt(~visible, return_distances=False, return_indices=True)
+        rgb[~visible] = rgb[tuple(i[~visible] for i in indices)]
+    smooth = np.asarray(Image.fromarray(rgb).resize(nearest.size, Image.Resampling.LANCZOS))
+    return Image.fromarray(np.dstack((smooth, np.asarray(nearest.getchannel('A')))))
 
 
 class RepairModel(Comfy):
@@ -495,12 +513,25 @@ class Controller:
     def precheck(self, work, key, group, accepted, initial):
         """Return an already completed direction without invoking ComfyUI."""
         job = work.name
+        saved = read_json(self.out/'jobs'/job/'state.json', {'groups': {}})['groups'].get(key)
+        if (not self.audit_only and saved and saved.get('accepted')
+                and group['art'].startswith('art/critters/')
+                and (saved.get('fallback') == 'original_game_art'
+                     or (saved.get('provenance') or {}).get('kind') == 'original_game_art')):
+            return self.soft_critter(work, key, group) or saved
+        if (not self.audit_only and saved and saved.get('fallback') == 'source_soft_2x'
+                and saved.get('accepted') and all(
+                    (self.out/'jobs'/job/'hd'/f['rel']).is_file() and
+                    saved.get('hashes', {}).get(f['rel']) == file_digest(self.out/'jobs'/job/'hd'/f['rel'])
+                    for f in group['frames'])):
+            for f in group['frames']:
+                self.hd_index[f['rel']] = self.out/'jobs'/job/'hd'/f['rel']
+            return saved
         if accepted and initial and initial['complete']:
             return {'source':'production', 'gate':initial, 'fallback':None, 'accepted':True}
         if self.audit_only:
             return {'source':'production' if accepted else 'rejected_candidate',
                     'gate':initial, 'fallback':None, 'accepted':bool(initial and initial['complete'])}
-        saved = read_json(self.out/'jobs'/job/'state.json', {'groups': {}})['groups'].get(key)
         if saved:
             if saved.get('source') == 'production' and initial and initial['complete']:
                 return saved
@@ -512,6 +543,29 @@ class Controller:
                     self.hd_index[f['rel']] = self.out/'jobs'/job/'hd'/f['rel']
                 return saved
         return None
+
+    def soft_critter(self, work, key, group):
+        """Replace one whole direction and checkpoint it without rendering."""
+        job = work.name
+        source = self._save_images(job, group,
+            [source_soft_2x(self.original(f['rel'])) for f in group['frames']], 'source-soft')
+        gate = self.gate(work, group, source)
+        if not gate['complete']:
+            return None
+        hashes = {}
+        for f in group['frames']:
+            path = self.out/'jobs'/job/'hd'/f['rel']
+            atomic_copy(source/f['rel'], path)
+            self.hd_index[f['rel']] = path
+            hashes[f['rel']] = self._digest(path, refresh=True)
+        result = {'source': str(source), 'gate': gate, 'hashes': hashes,
+                  'fallback': 'source_soft_2x', 'provenance': {'kind': 'source_soft_2x'},
+                  'accepted': True}
+        state_path = self.out/'jobs'/job/'state.json'
+        state = read_json(state_path, {'groups': {}})
+        state['groups'][key] = result
+        atomic_json(state_path, state)
+        return result
 
     def process_group(self, work, key, group, accepted, prepared=None, initial=None):
         job = work.name
@@ -611,6 +665,9 @@ class Controller:
             last = self.gate(work, group, fallback)
             if last['complete']:
                 source, method = fallback, {'kind':'source_floor_2x'}
+        elif (source is None and group['art'].startswith('art/critters/')
+              and (soft := self.soft_critter(work, key, group))):
+            return soft
         elif source is None:
             # Non-floor art cannot borrow floor pixels; production falls back to
             # the untouched game art for the whole direction, so do the same.
